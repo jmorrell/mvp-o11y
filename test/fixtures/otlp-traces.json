@@ -1,0 +1,48 @@
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "checkout"
+            }
+          }
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": {
+            "name": "test"
+          },
+          "spans": [
+            {
+              "traceId": "00112233445566778899aabbccddeeff",
+              "spanId": "0123456789abcdef",
+              "name": "POST /checkout",
+              "kind": 2,
+              "startTimeUnixNano": "1791676800123456789",
+              "endTimeUnixNano": "1791676800223456789",
+              "status": {
+                "code": 2
+              },
+              "events": [
+                {
+                  "timeUnixNano": "1791676800123456789",
+                  "name": "retry"
+                }
+              ],
+              "links": [
+                {
+                  "traceId": "00112233445566778899aabbccddeeff",
+                  "spanId": "0123456789abcdef"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

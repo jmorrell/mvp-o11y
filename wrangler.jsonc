@@ -1,0 +1,32 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "mvp-o11y",
+  "main": "src/worker/index.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": {
+    "directory": "./dist/client",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*", "/v1/*", "/mcp", "/health"],
+  },
+  "r2_buckets": [{ "binding": "ARCHIVE", "bucket_name": "mvp-o11y-archive" }],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "mvp-o11y",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations",
+    },
+  ],
+  // After creating a K2 stream, uncomment and set its real stream ID:
+  // "k2": [{"binding":"INGEST","stream":"YOUR_32_CHARACTER_STREAM_ID"}],
+  "triggers": { "crons": ["* * * * *"] },
+  "observability": { "enabled": true },
+  "vars": {
+    "CLICKHOUSE_DATABASE": "default",
+    "CLICKHOUSE_USER": "default",
+    "PUBLIC_BASE_URL": "http://localhost:8787",
+    "WEBHOOK_ALLOWED_HOSTS": "",
+  },
+}

@@ -1,0 +1,190 @@
+{
+  "resourceMetrics": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "checkout"
+            }
+          }
+        ]
+      },
+      "scopeMetrics": [
+        {
+          "scope": {
+            "name": "test"
+          },
+          "metrics": [
+            {
+              "name": "connections",
+              "gauge": {
+                "dataPoints": [
+                  {
+                    "timeUnixNano": "1791676800123456789",
+                    "startTimeUnixNano": "1791676740000000000",
+                    "attributes": [
+                      {
+                        "key": "region",
+                        "value": {
+                          "stringValue": "iad"
+                        }
+                      }
+                    ],
+                    "asInt": "42",
+                    "exemplars": [
+                      {
+                        "timeUnixNano": "1791676800123456789",
+                        "traceId": "00112233445566778899aabbccddeeff",
+                        "spanId": "0123456789abcdef",
+                        "asDouble": 12.5
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "name": "requests",
+              "sum": {
+                "aggregationTemporality": 2,
+                "isMonotonic": true,
+                "dataPoints": [
+                  {
+                    "timeUnixNano": "1791676800123456789",
+                    "startTimeUnixNano": "1791676740000000000",
+                    "attributes": [
+                      {
+                        "key": "region",
+                        "value": {
+                          "stringValue": "iad"
+                        }
+                      }
+                    ],
+                    "asInt": "9007199254740993"
+                  }
+                ]
+              }
+            },
+            {
+              "name": "latency",
+              "histogram": {
+                "aggregationTemporality": 1,
+                "dataPoints": [
+                  {
+                    "timeUnixNano": "1791676800123456789",
+                    "startTimeUnixNano": "1791676740000000000",
+                    "attributes": [
+                      {
+                        "key": "region",
+                        "value": {
+                          "stringValue": "iad"
+                        }
+                      }
+                    ],
+                    "count": "3",
+                    "sum": 31.5,
+                    "min": 5,
+                    "max": 20,
+                    "bucketCounts": [
+                      "1",
+                      "2"
+                    ],
+                    "explicitBounds": [
+                      10
+                    ],
+                    "exemplars": [
+                      {
+                        "timeUnixNano": "1791676800123456789",
+                        "traceId": "00112233445566778899aabbccddeeff",
+                        "spanId": "0123456789abcdef",
+                        "asDouble": 12.5
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "name": "latency.exp",
+              "exponentialHistogram": {
+                "aggregationTemporality": 2,
+                "dataPoints": [
+                  {
+                    "timeUnixNano": "1791676800123456789",
+                    "startTimeUnixNano": "1791676740000000000",
+                    "attributes": [
+                      {
+                        "key": "region",
+                        "value": {
+                          "stringValue": "iad"
+                        }
+                      }
+                    ],
+                    "count": "3",
+                    "sum": 31.5,
+                    "min": 5,
+                    "max": 20,
+                    "scale": 0,
+                    "zeroCount": "0",
+                    "positive": {
+                      "offset": 2,
+                      "bucketCounts": [
+                        "1",
+                        "2"
+                      ]
+                    },
+                    "negative": {
+                      "offset": 0,
+                      "bucketCounts": []
+                    },
+                    "exemplars": [
+                      {
+                        "timeUnixNano": "1791676800123456789",
+                        "traceId": "00112233445566778899aabbccddeeff",
+                        "spanId": "0123456789abcdef",
+                        "asDouble": 12.5
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "name": "latency.summary",
+              "summary": {
+                "dataPoints": [
+                  {
+                    "timeUnixNano": "1791676800123456789",
+                    "startTimeUnixNano": "1791676740000000000",
+                    "attributes": [
+                      {
+                        "key": "region",
+                        "value": {
+                          "stringValue": "iad"
+                        }
+                      }
+                    ],
+                    "count": "3",
+                    "sum": 31.5,
+                    "quantileValues": [
+                      {
+                        "quantile": 0.5,
+                        "value": 6.5
+                      },
+                      {
+                        "quantile": 0.99,
+                        "value": 20
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

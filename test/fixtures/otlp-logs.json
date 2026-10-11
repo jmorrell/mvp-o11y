@@ -1,0 +1,36 @@
+{
+  "resourceLogs": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "checkout"
+            }
+          }
+        ]
+      },
+      "scopeLogs": [
+        {
+          "scope": {
+            "name": "test"
+          },
+          "logRecords": [
+            {
+              "timeUnixNano": "1791676800123456789",
+              "traceId": "00112233445566778899aabbccddeeff",
+              "spanId": "0123456789abcdef",
+              "severityNumber": 17,
+              "severityText": "ERROR",
+              "body": {
+                "stringValue": "payment timed out"
+              },
+              "eventName": "payment.error"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

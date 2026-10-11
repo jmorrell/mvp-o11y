@@ -1,0 +1,2 @@
+# Preserve formatting of pinned upstream protocol definitions.
+proto/** -whitespace

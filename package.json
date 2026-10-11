@@ -1,0 +1,38 @@
+{
+  "name": "mvp-o11y",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "npm run build:web && wrangler dev",
+    "dev:web": "vite --host 0.0.0.0",
+    "build:web": "vite build && vite build --config vite.mcp.config.ts",
+    "build": "npm run build:web && wrangler deploy --dry-run --outdir dist/worker",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm test && npm run build",
+    "deploy": "npm run build:web && wrangler deploy"
+  },
+  "dependencies": {
+    "@cloudflare/kumo": "2.14.0",
+    "@modelcontextprotocol/ext-apps": "2.0.3",
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "@phosphor-icons/react": "^2.1.10",
+    "protobufjs": "^7.5.4",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "zod": "^4.2.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "latest",
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^5.1.1",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.1",
+    "vite-plugin-singlefile": "^2.3.0",
+    "vitest": "^3.2.4",
+    "wrangler": "4.149.0"
+  }
+}

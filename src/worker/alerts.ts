@@ -1,28 +1,81 @@
 import { z } from "zod";
-import type { AlertInput, AlertRule, QueryResult } from "../shared/types";
+import type {
+  AlertInput,
+  AlertRule,
+  QueryResult,
+  QuerySpec,
+} from "../shared/types";
 import type { Env } from "./env";
-import { runQuery } from "./queries";
+import { runQuery, sqlParametersSchema, sqlQuerySchema } from "./queries";
 
 const alertFieldsSchema = z
   .object({
     name: z.string().trim().min(1).max(120),
-    template: z.enum(["error_rate", "request_rate"]),
+    template: z.enum(["error_rate", "request_rate"]).optional(),
+    sql: sqlQuerySchema.shape.sql.optional(),
+    parameters: sqlParametersSchema
+      .superRefine((parameters, ctx) => {
+        if (Object.keys(parameters).length > 98)
+          ctx.addIssue({
+            code: "custom",
+            message: "At most 98 custom alert parameters are supported",
+          });
+        for (const name of ["from", "to"])
+          if (Object.hasOwn(parameters, name))
+            ctx.addIssue({
+              code: "custom",
+              path: [name],
+              message: `${name} is reserved for the alert evaluation window`,
+            });
+      })
+      .optional(),
+    valueColumn: z.string().trim().min(1).max(256).optional(),
     service: z.string().trim().min(1).max(256).optional(),
     windowMinutes: z.number().int().min(1).max(1440),
-    threshold: z.number().finite().nonnegative(),
+    threshold: z.number().finite(),
     comparison: z.enum(["gt", "gte", "lt", "lte"]),
     webhookUrl: z.string().url().max(2048),
     cooldownMinutes: z.number().int().min(1).max(10080),
     enabled: z.boolean(),
   })
   .strict();
-export const alertInputSchema = alertFieldsSchema.extend({
-  windowMinutes: alertFieldsSchema.shape.windowMinutes.default(5),
-  comparison: alertFieldsSchema.shape.comparison.default("gt"),
-  cooldownMinutes: alertFieldsSchema.shape.cooldownMinutes.default(15),
-  enabled: alertFieldsSchema.shape.enabled.default(true),
-});
-export const alertPatchSchema = alertFieldsSchema.partial();
+export const alertInputSchema = alertFieldsSchema
+  .extend({
+    windowMinutes: alertFieldsSchema.shape.windowMinutes.default(5),
+    comparison: alertFieldsSchema.shape.comparison.default("gt"),
+    cooldownMinutes: alertFieldsSchema.shape.cooldownMinutes.default(15),
+    enabled: alertFieldsSchema.shape.enabled.default(true),
+  })
+  .superRefine((rule, ctx) => {
+    if ((rule.template !== undefined) === (rule.sql !== undefined))
+      ctx.addIssue({
+        code: "custom",
+        message: "Supply exactly one of sql or template",
+      });
+    if (rule.sql !== undefined && rule.service !== undefined)
+      ctx.addIssue({
+        code: "custom",
+        path: ["service"],
+        message: "Use SQL parameters to filter a SQL alert by service",
+      });
+    if (
+      rule.template !== undefined &&
+      (rule.parameters !== undefined || rule.valueColumn !== undefined)
+    )
+      ctx.addIssue({
+        code: "custom",
+        message: "parameters and valueColumn are only supported for SQL alerts",
+      });
+  });
+export const alertPatchSchema = alertFieldsSchema
+  .partial()
+  .superRefine((patch, ctx) => {
+    if (patch.sql !== undefined && patch.template !== undefined)
+      ctx.addIssue({
+        code: "custom",
+        message: "Supply exactly one of sql or template",
+      });
+  });
 
 interface RuleRow {
   id: string;
@@ -144,8 +197,18 @@ export async function updateAlert(
     .bind(id)
     .first<RuleRow>();
   if (!row) return null;
+  const previous = JSON.parse(row.input_json) as AlertInput;
+  // Selecting a source also clears fields that belong exclusively to the previous source.
+  if (patch.sql !== undefined) {
+    delete previous.template;
+    delete previous.service;
+  } else if (patch.template !== undefined) {
+    delete previous.sql;
+    delete previous.parameters;
+    delete previous.valueColumn;
+  }
   const rule = validateInput(env, {
-    ...(JSON.parse(row.input_json) as AlertInput),
+    ...previous,
     ...patch,
   });
   await env.DB.prepare("UPDATE alert_rules SET input_json = ? WHERE id = ?")
@@ -169,6 +232,19 @@ export function alertValue(
   result: QueryResult,
 ): number | null {
   if (result.truncated) return null;
+  if (rule.sql !== undefined) {
+    if (result.rows.length !== 1) return null;
+    const scalar = result.rows[0][rule.valueColumn ?? "value"];
+    // ClickHouse encodes wide integers and decimals as strings; reject coercions of null/booleans.
+    if (
+      typeof scalar !== "number" &&
+      (typeof scalar !== "string" ||
+        !/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(scalar.trim()))
+    )
+      return null;
+    const value = Number(scalar);
+    return Number.isFinite(value) ? value : null;
+  }
   if (rule.template === "request_rate") {
     const values = result.rows.map((row) => Number(row.value));
     return values.every(Number.isFinite)
@@ -226,15 +302,27 @@ async function evaluateRule(env: Env, row: RuleRow, end: Date): Promise<void> {
   const from = new Date(
     end.getTime() - rule.windowMinutes * 60_000,
   ).toISOString();
-  const query = {
-    template: rule.template,
-    from,
-    to,
-    ...(rule.service ? { service: rule.service } : {}),
-    limit: 10000,
-  } as const;
+  const query: QuerySpec =
+    rule.sql !== undefined
+      ? {
+          sql: rule.sql,
+          parameters: { ...rule.parameters, from, to },
+          limit: 2,
+        }
+      : {
+          template: rule.template!,
+          from,
+          to,
+          ...(rule.service ? { service: rule.service } : {}),
+          limit: 10000,
+        };
   const result = await runQuery(env, query);
   const value = alertValue(rule, result);
+  if (rule.sql !== undefined && value === null)
+    throw new AlertError(
+      "SQL alert must return exactly one row with a finite numeric value",
+      502,
+    );
   const cooldownCutoff = new Date(
     end.getTime() - rule.cooldownMinutes * 60_000,
   ).toISOString();
@@ -260,12 +348,21 @@ async function evaluateRule(env: Env, row: RuleRow, end: Date): Promise<void> {
       name: rule.name,
       template: rule.template,
       service: rule.service,
+      valueColumn:
+        rule.sql !== undefined ? (rule.valueColumn ?? "value") : undefined,
       threshold: rule.threshold,
       comparison: rule.comparison,
     },
     value,
-    unit: rule.template === "error_rate" ? "percent" : "requests_per_second",
+    unit:
+      rule.sql !== undefined
+        ? "value"
+        : rule.template === "error_rate"
+          ? "percent"
+          : "requests_per_second",
     query,
+    sql: result.sql,
+    parameters: result.parameters,
   });
   // D1 batches are transactional. The window predicate prevents duplicate concurrent cron runs.
   await env.DB.batch([

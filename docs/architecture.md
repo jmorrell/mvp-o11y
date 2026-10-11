@@ -12,9 +12,9 @@ K2 polling is driven by Cron Triggers until K2 supports Worker push consumers. A
 
 ## A saved visualization is an immutable result
 
-Live queries use allowlisted templates with typed parameters, explicit UTC time bounds, and ordering. Snapshot creation saves the actual executed SQL and parameters alongside the rows and rendering kind. Rendering a saved result never calls ClickHouse. A UUID URL identifies the immutable object; a digest of the versioned content provides a reproducibility check. Query specifications use millisecond UTC boundaries. Row limits and truncation are recorded.
+Live queries execute the supplied ClickHouse SQL with bound parameters and a dedicated SELECT-only account. Optional presets provide examples with explicit UTC time bounds and ordering. ClickHouse parses the complete statement and enforces privileges and immutable settings constraints; the Worker does not classify SQL using a keyword blacklist. Snapshot creation saves the actual executed SQL and parameters alongside the rows and rendering kind. Rendering a saved result never calls ClickHouse. A UUID URL identifies the immutable object; a digest of the versioned content provides a reproducibility check. Preset windows use millisecond UTC boundaries. Row limits and truncation are recorded.
 
-Presets are the initial deterministic query language. A future SQL interface needs a real parser, a read-only role, cost budgets, query versioning, and rules for nondeterministic functions; regular-expression filtering would be insufficient.
+Arbitrary SQL is the primary query interface. SQL is sent unchanged, including comments and trailing semicolons; the HTTP interface supplies the default JSON result format. Dedicated query credentials are required for custom SQL, and server-side constraints plus Worker response limits bound resource use. Queries may deliberately use functions such as `now()` or `rand()`. Explicit parameters and ordering make the query definition repeatable; the immutable snapshot captures the actual result even when later executions differ. Column mappings are saved with charts so arbitrary SQL aliases work in the dashboard and MCP App.
 
 ## MCP is a first-class interface
 
@@ -22,8 +22,8 @@ REST, MCP, the dashboard, and scheduled alert evaluation invoke the same service
 
 ## Alerts for agents
 
-Rules select a deterministic preset and an evaluation window. Each minute's evaluation has fixed boundaries and creates an outbox event when the threshold and cooldown conditions match. Webhook destinations are explicitly configured HTTPS hosts. Signatures cover the timestamp and exact payload bytes; receivers verify freshness and deduplicate event IDs. Delivery attempts and failures are durable in D1.
+Rules supply SQL and a numeric result column, or select an existing preset, together with an evaluation window. SQL rules receive reserved absolute `from` and `to` parameters and must return one numeric scalar row. Each minute's evaluation has fixed boundaries and creates an outbox event when the threshold and cooldown conditions match. Webhook destinations are explicitly configured HTTPS hosts. Signatures cover the timestamp and exact payload bytes; receivers verify freshness and deduplicate event IDs. Delivery attempts and failures are durable in D1.
 
 ## Retention and future work
 
-K2 is a transient transport with finite retention. R2 archives and ClickHouse tables have no automatic expiry. Storage cost grows with telemetry volume. Future priorities are replay/backfill tooling, ingestion lag/poison-record visibility, tenant isolation and OAuth, metric query presets, alert evidence snapshots/recovery signals, and K2 push consumers when available.
+K2 is a transient transport with finite retention. R2 archives and ClickHouse tables have no automatic expiry. Storage cost grows with telemetry volume. Future priorities are replay/backfill tooling, ingestion lag/poison-record visibility, tenant isolation and OAuth, additional metric query examples, alert evidence snapshots/recovery signals, and K2 push consumers when available.

@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 import { Visualization } from "../src/web/Visualization";
-import type { QueryResult } from "../src/shared/types";
+import type { PresetQuerySpec, QueryResult } from "../src/shared/types";
 
 const result = (
-  template: QueryResult["query"]["template"],
+  template: PresetQuerySpec["template"],
   rows: QueryResult["rows"],
   to = "2026-10-11T10:10:00Z",
 ): QueryResult => ({
@@ -100,5 +100,217 @@ describe("telemetry visualization accuracy", () => {
     // A 0.5 ms offset in a 2 ms trace is 25%; truncating timestamps would lose it.
     expect(positions).toEqual([0, 25]);
     expect(html).not.toContain("NaN");
+  });
+});
+
+const sqlResult = (rows: QueryResult["rows"]): QueryResult => ({
+  ...result("request_rate", rows),
+  query: { sql: "SELECT custom_columns FROM telemetry" },
+  sql: "SELECT custom_columns FROM telemetry",
+});
+
+describe("arbitrary SQL visualizations", () => {
+  it("uses returned timestamps, sorts by instant, and plots negative custom values within the chart", () => {
+    const html = renderToStaticMarkup(
+      <Visualization
+        kind="line"
+        mapping={{ time: "at", value: "temperature", series: "region" }}
+        result={sqlResult([
+          { at: "2026-10-11T12:00:00+02:00", temperature: 10, region: "north" },
+          {
+            at: Date.parse("2026-10-11T09:00:00Z"),
+            temperature: -10,
+            region: "north",
+          },
+          { at: "2026-10-11 09:30:00", temperature: 0, region: "north" },
+        ])}
+      />,
+    );
+    const positions = [
+      ...html.matchAll(/<circle[^>]*cx="([\d.]+)" cy="([\d.]+)"/g),
+    ].map((match) => [Number(match[1]), Number(match[2])]);
+    expect(positions).toHaveLength(3);
+    expect(positions[0][0]).toBeCloseTo(52);
+    expect(positions[2][0]).toBeCloseTo(878);
+    expect(positions[1][0]).toBeCloseTo((52 + 878) / 2);
+    expect(positions[0][1]).toBeGreaterThan(positions[1][1]);
+    expect(positions[1][1]).toBeGreaterThan(positions[2][1]);
+    expect(positions.every(([, y]) => y >= 20 && y <= 272)).toBe(true);
+    expect(html).toContain("north");
+    expect(html).not.toContain("Requests / second");
+    expect(html).not.toContain("NaN");
+  });
+
+  it("uses explicit SQL bucket widths to keep gaps disconnected", () => {
+    const html = renderToStaticMarkup(
+      <Visualization
+        kind="line"
+        mapping={{ timeBucketMs: 300000 }}
+        result={sqlResult([
+          { time: "2026-10-11T10:00:00Z", value: 10 },
+          { time: "2026-10-11T10:05:00Z", value: 20 },
+          { time: "2026-10-11T10:20:00Z", value: 30 },
+        ])}
+      />,
+    );
+    const paths = [...html.matchAll(/<path d="([^"]+)" fill="none"/g)].map(
+      (match) => match[1],
+    );
+    expect(paths).toHaveLength(2);
+    expect(paths[0].match(/L/g)).toHaveLength(1);
+    expect(paths[1]).not.toContain("L");
+  });
+
+  it("infers SQL time spacing without imposing the preset one-minute cadence", () => {
+    const html = renderToStaticMarkup(
+      <Visualization
+        kind="line"
+        result={sqlResult([
+          { time: "2026-10-11T10:00:00Z", value: 1 },
+          { time: "2026-10-11T10:05:00Z", value: 2 },
+          { time: "2026-10-11T10:10:00Z", value: 3 },
+        ])}
+      />,
+    );
+    const paths = [...html.matchAll(/<path d="([^"]+)" fill="none"/g)].map(
+      (match) => match[1],
+    );
+    expect(paths).toHaveLength(1);
+    expect(paths[0].match(/L/g)).toHaveLength(2);
+  });
+
+  it("renders custom sparse heatmap bins with generic units and returned time bounds", () => {
+    const rows = Array.from({ length: 100 }, (_, index) => ({
+      at: Date.parse("2026-10-11T10:00:00Z") + index * 300000,
+      temperature: -20 + index * 0.5,
+      samples: index + 1,
+    }));
+    const html = renderToStaticMarkup(
+      <Visualization
+        kind="heatmap"
+        mapping={{
+          time: "at",
+          bucket: "temperature",
+          count: "samples",
+          timeBucketMs: 300000,
+          valueBucketSize: 0.5,
+        }}
+        result={sqlResult(rows)}
+      />,
+    );
+    expect(html.match(/<rect\b/g)).toHaveLength(rows.length + 1);
+    expect(html).toContain("-20–-19.5 · 1 observations");
+    expect(html).toContain("300 s × 0.5 buckets");
+    expect(html).not.toContain("latency");
+    expect(html).not.toContain(" spans");
+    expect(html).not.toContain("NaN");
+  });
+
+  it("infers heatmap dimensions from SQL results", () => {
+    const html = renderToStaticMarkup(
+      <Visualization
+        kind="heatmap"
+        result={sqlResult([
+          { time: "2026-10-11 10:00:00", bucket: -5, count: 2 },
+          { time: "2026-10-11 10:05:00", bucket: -2.5, count: 3 },
+        ])}
+      />,
+    );
+    expect(html).toContain("300 s × 2.5 buckets");
+    expect(html).toContain("-5–-2.5 · 2 observations");
+    expect(html).not.toContain("NaN");
+  });
+
+  it("maps SQL waterfall fields and accepts both date strings and numeric epoch milliseconds", () => {
+    const epoch = Date.parse("2026-10-11T10:00:00Z");
+    const html = renderToStaticMarkup(
+      <Visualization
+        kind="waterfall"
+        mapping={{
+          startTime: "started",
+          durationMs: "elapsed",
+          spanId: "id",
+          parentSpanId: "parent",
+          name: "operation",
+          service: "app",
+          status: "outcome",
+        }}
+        result={sqlResult([
+          {
+            id: "root",
+            parent: "",
+            operation: "request",
+            app: "api",
+            started: epoch,
+            elapsed: 10,
+            outcome: "Ok",
+          },
+          {
+            id: "child",
+            parent: "root",
+            operation: "query",
+            app: "db",
+            started: "2026-10-11 10:00:00.002500",
+            elapsed: "5",
+            outcome: "Error",
+          },
+          { id: "invalid", started: "bad timestamp", elapsed: -3 },
+        ])}
+      />,
+    );
+    const positions = [
+      ...html.matchAll(/class="span-bar [^"]*" style="left:([\d.]+)%/g),
+    ].map((match) => Number(match[1]));
+    expect(positions).toEqual([0, 25]);
+    expect(html).toContain("padding-left:28px");
+    expect(html).toContain("span-error");
+    expect(html).toContain("Skipped 1 row");
+    expect(html).not.toContain("NaN");
+  });
+
+  it.each(["line", "heatmap", "waterfall"] as const)(
+    "explains missing mappings for %s without plotting invented zeroes",
+    (kind) => {
+      const html = renderToStaticMarkup(
+        <Visualization kind={kind} result={sqlResult([{ unrelated: 123 }])} />,
+      );
+      expect(html).toContain("No plottable rows");
+      expect(html).toContain("column mappings");
+      expect(html).not.toContain("NaN");
+      expect(html).not.toContain("<svg");
+    },
+  );
+
+  it("skips invalid SQL points without converting empty numeric values to zero", () => {
+    const html = renderToStaticMarkup(
+      <Visualization
+        kind="line"
+        result={sqlResult([
+          { time: "2026-10-11T10:00:00Z", value: null },
+          { time: "2026-10-11T10:01:00Z", value: "" },
+          { time: "not a date", value: 12 },
+          { time: "2026-10-11T10:03:00Z", value: "Infinity" },
+          { time: "2026-10-11T10:04:00Z", value: -4 },
+        ])}
+      />,
+    );
+    expect(html.match(/<circle\b/g)).toHaveLength(1);
+    expect(html).toContain("Skipped 4 rows");
+    expect(html).not.toContain("NaN");
+  });
+
+  it("renders arbitrary table columns directly", () => {
+    const html = renderToStaticMarkup(
+      <Visualization
+        kind="table"
+        result={sqlResult([
+          { region: "north", mean: -4, tags: { cluster: "a" } },
+        ])}
+      />,
+    );
+    expect(html).toContain("<th>region</th><th>mean</th><th>tags</th>");
+    expect(html).toContain("north");
+    expect(html).toContain("-4");
+    expect(html).toContain("cluster");
   });
 });

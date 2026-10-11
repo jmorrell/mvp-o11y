@@ -3,7 +3,31 @@ import type { QuerySpec, QueryResult } from "../shared/types";
 import type { Env } from "./env";
 import { queryRows } from "./clickhouse";
 
-export const querySchema = z
+export const sqlParametersSchema = z
+  .record(
+    z
+      .string()
+      .regex(/^[A-Za-z_][A-Za-z0-9_]*$/)
+      .max(128),
+    z.union([z.string().max(64_000), z.number().finite()]),
+  )
+  .refine((parameters) => Object.keys(parameters).length <= 100, {
+    message: "At most 100 SQL parameters are supported",
+  });
+export const sqlQuerySchema = z
+  .object({
+    sql: z
+      .string()
+      .min(1)
+      .max(48_000)
+      .refine((sql) => sql.trim().length > 0, {
+        message: "SQL must not be blank",
+      }),
+    parameters: sqlParametersSchema.optional(),
+    limit: z.number().int().min(1).max(10000).default(1000),
+  })
+  .strict();
+export const presetQuerySchema = z
   .object({
     template: z.enum([
       "request_rate",
@@ -36,6 +60,7 @@ export const querySchema = z
         message: "traceId is required for a waterfall",
       });
   });
+export const querySchema = z.union([sqlQuerySchema, presetQuerySchema]);
 export const QUERY_TEMPLATES = [
   {
     id: "request_rate",
@@ -83,6 +108,13 @@ export function compileQuery(input: unknown): {
   parameters: Record<string, string | number>;
 } {
   const parsed = querySchema.parse(input);
+  if ("sql" in parsed) {
+    return {
+      query: parsed,
+      sql: parsed.sql,
+      parameters: parsed.parameters ?? {},
+    };
+  }
   const query = {
     ...parsed,
     from: new Date(parsed.from).toISOString(),
@@ -121,7 +153,9 @@ export async function runQuery(
   input: QuerySpec,
 ): Promise<QueryResult> {
   const compiled = compileQuery(input);
-  const result = await queryRows(env, compiled.sql, compiled.parameters);
+  const result = await queryRows(env, compiled.sql, compiled.parameters, {
+    requireQueryCredentials: "sql" in compiled.query,
+  });
   const limit = compiled.query.limit || 1000;
   return {
     ...compiled,

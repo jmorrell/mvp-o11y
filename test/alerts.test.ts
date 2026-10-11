@@ -16,7 +16,10 @@ import {
 } from "../src/worker/alerts";
 import { runQuery } from "../src/worker/queries";
 
-vi.mock("../src/worker/queries", () => ({ runQuery: vi.fn() }));
+vi.mock("../src/worker/queries", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/worker/queries")>()),
+  runQuery: vi.fn(),
+}));
 
 const base: AlertInput = {
   name: "API error rate",
@@ -25,6 +28,23 @@ const base: AlertInput = {
   threshold: 10,
   comparison: "gt",
   webhookUrl: "https://hooks.example.com/alert",
+  cooldownMinutes: 15,
+  enabled: true,
+};
+const sqlBase: AlertInput = {
+  name: "Checkout p99 latency",
+  sql: `WITH selected AS (
+    SELECT Duration FROM otel_traces
+    WHERE Timestamp >= parseDateTime64BestEffort({from:String}, 9, 'UTC')
+      AND Timestamp < parseDateTime64BestEffort({to:String}, 9, 'UTC')
+      AND ServiceName = {service:String}
+  ) SELECT quantile(0.99)(Duration) / 1000000 AS p99 FROM selected`,
+  parameters: { service: "checkout" },
+  valueColumn: "p99",
+  windowMinutes: 5,
+  threshold: 500,
+  comparison: "gt",
+  webhookUrl: base.webhookUrl,
   cooldownMinutes: 15,
   enabled: true,
 };
@@ -161,6 +181,161 @@ describe("durable alert rules and webhook delivery", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("requires one query source and reserves the SQL window parameters", async () => {
+    const { template: _template, ...withoutSource } = base;
+    for (const input of [
+      withoutSource,
+      { ...base, sql: "SELECT 1 AS value" },
+      { ...sqlBase, sql: "  " },
+      { ...sqlBase, service: "checkout" },
+      { ...base, parameters: { service: "checkout" } },
+      { ...base, valueColumn: "value" },
+      { ...sqlBase, parameters: { from: "2026-01-01T00:00:00Z" } },
+      { ...sqlBase, parameters: { to: "2026-01-01T00:00:00Z" } },
+      { ...sqlBase, parameters: { service: null } },
+      { ...sqlBase, parameters: { service: true } },
+      { ...sqlBase, parameters: { number: Infinity } },
+    ])
+      await expect(createAlert(env, input)).rejects.toThrow();
+    expect(await listAlerts(env)).toEqual([]);
+    expect(
+      await createAlert(env, { ...sqlBase, threshold: -10 }),
+    ).toMatchObject({
+      sql: sqlBase.sql,
+      threshold: -10,
+    });
+  });
+
+  it("switches between SQL and preset queries without resetting common fields", async () => {
+    const created = await createAlert(env, {
+      ...base,
+      service: "checkout",
+      windowMinutes: 10,
+      cooldownMinutes: 60,
+      enabled: false,
+    });
+    const sql = await updateAlert(env, created.id, {
+      sql: sqlBase.sql,
+      parameters: sqlBase.parameters,
+      valueColumn: "p99",
+    });
+    expect(sql).toMatchObject({
+      sql: sqlBase.sql,
+      parameters: sqlBase.parameters,
+      valueColumn: "p99",
+      windowMinutes: 10,
+      cooldownMinutes: 60,
+      enabled: false,
+    });
+    expect(sql).not.toHaveProperty("template");
+    expect(sql).not.toHaveProperty("service");
+    await expect(
+      updateAlert(env, created.id, {
+        template: "error_rate",
+        sql: "SELECT 0 AS value",
+      }),
+    ).rejects.toThrow();
+    await expect(
+      updateAlert(env, created.id, {
+        parameters: { from: "yesterday" },
+      }),
+    ).rejects.toThrow();
+    const renamed = await updateAlert(env, created.id, { name: "Latency" });
+    expect(renamed).toMatchObject({
+      sql: sqlBase.sql,
+      parameters: sqlBase.parameters,
+      valueColumn: "p99",
+    });
+    const preset = await updateAlert(env, created.id, {
+      template: "request_rate",
+      service: "api",
+    });
+    expect(preset).toMatchObject({
+      template: "request_rate",
+      service: "api",
+      windowMinutes: 10,
+      cooldownMinutes: 60,
+      enabled: false,
+    });
+    expect(preset).not.toHaveProperty("sql");
+    expect(preset).not.toHaveProperty("parameters");
+    expect(preset).not.toHaveProperty("valueColumn");
+  });
+
+  it("evaluates arbitrary SQL with fixed window bindings and retries immutable query evidence", async () => {
+    const rule = await createAlert(env, sqlBase);
+    const parameters = {
+      service: "checkout",
+      from: "2026-10-11T00:00:00.000Z",
+      to: "2026-10-11T00:05:00.000Z",
+    };
+    vi.mocked(runQuery).mockResolvedValue({
+      ...result([{ p99: "750.5" }]),
+      sql: sqlBase.sql!,
+      parameters,
+    });
+    fetchMock.mockResolvedValueOnce(new Response(null, { status: 503 }));
+    await pollAlerts(env, new Date("2026-10-11T00:05:30Z"));
+    expect(runQuery).toHaveBeenCalledWith(env, {
+      sql: sqlBase.sql,
+      parameters,
+      limit: 2,
+    });
+    const firstBody = fetchMock.mock.calls[0][1]!.body as string;
+    expect(JSON.parse(firstBody)).toMatchObject({
+      id: `${rule.id}:2026-10-11T00:05:00.000Z`,
+      alert: { id: rule.id, valueColumn: "p99" },
+      value: 750.5,
+      unit: "value",
+      sql: sqlBase.sql,
+      parameters,
+      query: { sql: sqlBase.sql, parameters, limit: 2 },
+    });
+    await updateAlert(env, rule.id, { sql: "SELECT 999 AS p99" });
+    await pollAlerts(env, new Date("2026-10-11T00:06:31Z"));
+    expect(fetchMock.mock.calls[1][1]!.body).toBe(firstBody);
+  });
+
+  it("records SQL evaluation failures without triggering or logging query details", async () => {
+    const rule = await createAlert(env, sqlBase);
+    const logger = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      for (const response of [
+        result([]),
+        result([{ p99: null }]),
+        result([{ p99: 750 }, { p99: 900 }]),
+        { ...result([{ p99: 750 }]), truncated: true },
+      ]) {
+        vi.mocked(runQuery).mockResolvedValueOnce(response);
+        expect(await pollAlerts(env, new Date("2026-10-11T00:05:30Z"))).toEqual(
+          {
+            evaluated: 0,
+            failed: 1,
+            delivered: 0,
+          },
+        );
+      }
+      vi.mocked(runQuery).mockRejectedValueOnce(
+        new Error("credential-or-sql-must-not-be-logged"),
+      );
+      expect(
+        (await pollAlerts(env, new Date("2026-10-11T00:05:30Z"))).failed,
+      ).toBe(1);
+      expect(logger.mock.calls).toEqual(
+        Array(5).fill(["Alert evaluation failed", { alertId: rule.id }]),
+      );
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect((await listAlerts(env))[0].lastEvaluatedAt).toBeUndefined();
+      vi.mocked(runQuery).mockResolvedValueOnce(result([{ p99: 800 }]));
+      expect(
+        (await pollAlerts(env, new Date("2026-10-11T00:05:30Z"))).evaluated,
+      ).toBe(1);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      logger.mockRestore();
+    }
+  });
+
   it("enqueues one event per fixed window, signs it, and retries the same event after failure", async () => {
     const rule = await createAlert(env, base);
     fetchMock.mockResolvedValueOnce(new Response(null, { status: 503 }));
@@ -243,6 +418,38 @@ describe("durable alert rules and webhook delivery", () => {
 });
 
 describe("alert query semantics", () => {
+  it("requires one finite numeric SQL scalar, accepting ClickHouse decimal strings", () => {
+    const rule = { ...sqlBase, valueColumn: undefined };
+    for (const [scalar, value] of [
+      [0, 0],
+      [-10.5, -10.5],
+      ["123.4", 123.4],
+      ["1e3", 1000],
+    ] as const)
+      expect(alertValue(rule, result([{ value: scalar }]))).toBe(value);
+    for (const scalar of [
+      null,
+      undefined,
+      "",
+      "  ",
+      "NaN",
+      "Infinity",
+      "0xff",
+      true,
+      false,
+      [],
+      {},
+      Infinity,
+      NaN,
+    ])
+      expect(alertValue(rule, result([{ value: scalar }]))).toBeNull();
+    expect(alertValue(rule, result([]))).toBeNull();
+    expect(alertValue(rule, result([{ value: 1 }, { value: 2 }]))).toBeNull();
+    expect(
+      alertValue(rule, { ...result([{ value: 1 }]), truncated: true }),
+    ).toBeNull();
+    expect(alertValue(sqlBase, result([{ p99: 750, value: 1 }]))).toBe(750);
+  });
   it("averages rate buckets over the full window, including absent minutes", () => {
     expect(
       alertValue(

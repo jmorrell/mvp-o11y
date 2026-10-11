@@ -1,4 +1,9 @@
-import type { QueryResult, VisualizationKind } from "../shared/types";
+import {
+  isSqlQuery,
+  type QueryResult,
+  type VisualizationKind,
+  type VisualizationMapping,
+} from "../shared/types";
 
 const colors = ["#f48120", "#3b82f6", "#14b8a6", "#8b5cf6", "#ec4899"];
 const number = (value: unknown) => Number(value ?? 0);
@@ -20,39 +25,102 @@ export function formatNumber(value: number) {
     notation: value >= 10000 ? "compact" : "standard",
   }).format(value);
 }
-function timestampNs(value: string): bigint {
-  const normalized = value.replace(" ", "T");
+function numeric(value: unknown): number | undefined {
+  if (typeof value !== "number" && typeof value !== "string") return undefined;
+  if (typeof value === "string" && !value.trim()) return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+function timestampNs(value: unknown): bigint | undefined {
+  const epoch = numeric(value);
+  if (epoch !== undefined)
+    return Math.abs(epoch) <= 8.64e15
+      ? BigInt(Math.round(epoch * 1e6))
+      : undefined;
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().replace(" ", "T");
   const match = normalized.match(/^(.*?)(?:\.(\d+))?(Z|[+-]\d{2}:?\d{2})?$/);
-  if (!match) return 0n;
+  if (!match) return undefined;
   const milliseconds = Date.parse(`${match[1]}${match[3] || "Z"}`);
-  if (!Number.isFinite(milliseconds)) return 0n;
+  if (!Number.isFinite(milliseconds)) return undefined;
   return (
     BigInt(milliseconds) * 1000000n +
     BigInt((match[2] || "").padEnd(9, "0").slice(0, 9) || "0")
   );
 }
+function timeMs(value: unknown): number | undefined {
+  const nanoseconds = timestampNs(value);
+  return nanoseconds === undefined ? undefined : Number(nanoseconds) / 1e6;
+}
 function timeLabel(value: unknown) {
-  const date = new Date(String(value));
-  return Number.isNaN(date.valueOf())
+  const parsed = timeMs(value);
+  return parsed === undefined
     ? String(value)
-    : date.toISOString().slice(11, 16);
+    : new Date(parsed).toISOString().slice(11, 19);
+}
+function spacing(values: number[]): number | undefined {
+  const sorted = [...new Set(values)].sort((a, b) => a - b);
+  let minimum = Infinity;
+  for (let i = 1; i < sorted.length; i++)
+    minimum = Math.min(minimum, sorted[i] - sorted[i - 1]);
+  return Number.isFinite(minimum) && minimum > 0 ? minimum : undefined;
+}
+function positive(value: number | undefined) {
+  return value !== undefined && Number.isFinite(value) && value > 0
+    ? value
+    : undefined;
+}
+function MappingFeedback({ fields }: { fields: string }) {
+  return (
+    <div className="empty-visual">
+      <strong>No plottable rows</strong>
+      <p>
+        Choose column mappings for {fields}. Time columns accept date strings or
+        epoch milliseconds; numeric columns must contain finite numbers.
+      </p>
+    </div>
+  );
+}
+function SkippedRows({ count }: { count: number }) {
+  return count > 0 ? (
+    <p className="table-note">
+      Skipped {count} {count === 1 ? "row" : "rows"} with missing or invalid
+      mapped values. Check the column mappings and query results.
+    </p>
+  ) : null;
 }
 export function Visualization({
   result,
   kind,
   compact = false,
+  mapping = {},
 }: {
   result: QueryResult;
   kind: VisualizationKind;
   compact?: boolean;
+  mapping?: VisualizationMapping;
 }) {
   const rows = result.rows;
+  const sqlQuery = isSqlQuery(result.query);
+  const template = isSqlQuery(result.query) ? undefined : result.query.template;
+  const mapped = (
+    row: Record<string, unknown>,
+    key: Exclude<
+      keyof VisualizationMapping,
+      "timeBucketMs" | "valueBucketSize"
+    >,
+    aliases: string[],
+    fallback?: unknown,
+  ) => (mapping[key] ? row[mapping[key]] : pick(row, aliases, fallback));
+  const presetBounds = isSqlQuery(result.query)
+    ? undefined
+    : { from: timeMs(result.query.from), to: timeMs(result.query.to) };
   if (!rows.length)
     return (
       <div className="empty-visual">
         <span className="empty-orbit">∅</span>
         <strong>No matching events</strong>
-        <p>Try a wider time range or a different service.</p>
+        <p>Adjust the query or choose a wider time range.</p>
       </div>
     );
   if (kind === "table") {
@@ -88,40 +156,76 @@ export function Visualization({
         </table>
         {result.truncated && (
           <p className="table-note">
-            Result limit reached. Narrow the time range for more detail.
+            Result limit reached. Refine the query for more detail.
           </p>
         )}
       </div>
     );
   }
   if (kind === "waterfall") {
-    const spans = rows.map((row) => ({
-      name: String(pick(row, ["name", "span_name", "SpanName"], "span")),
-      service: String(
-        pick(row, ["service", "service_name", "ServiceName"], "service"),
-      ),
-      id: String(pick(row, ["spanId", "span_id", "SpanId"])),
-      parent: String(
-        pick(row, ["parentSpanId", "parent_span_id", "ParentSpanId"]),
-      ),
-      startNs:
-        row.start_ms !== undefined
-          ? BigInt(Math.round(Number(row.start_ms) * 1e6))
-          : row.startTimeUnixNano !== undefined
-            ? BigInt(String(row.startTimeUnixNano))
-            : timestampNs(
-                String(
-                  pick(row, [
-                    "startTime",
-                    "timestamp",
-                    "Timestamp",
-                    "start_time",
-                  ]),
-                ),
-              ),
-      duration: Number(pick(row, ["durationMs", "duration_ms", "duration"], 0)),
-      status: String(pick(row, ["status", "StatusCode", "status_code"])),
-    }));
+    const spans = rows.flatMap((row) => {
+      let startNs: bigint | undefined;
+      if (mapping.startTime) startNs = timestampNs(row[mapping.startTime]);
+      else if (row.start_ms !== undefined) startNs = timestampNs(row.start_ms);
+      else if (row.startTimeUnixNano !== undefined) {
+        const raw = String(row.startTimeUnixNano);
+        if (/^-?\d+$/.test(raw) && raw.length <= 23) {
+          const parsed = BigInt(raw);
+          if (
+            parsed >= -8640000000000000000000n &&
+            parsed <= 8640000000000000000000n
+          )
+            startNs = parsed;
+        }
+      } else
+        startNs = timestampNs(
+          pick(row, ["startTime", "timestamp", "Timestamp", "start_time"]),
+        );
+      const duration = numeric(
+        mapped(row, "durationMs", ["durationMs", "duration_ms", "duration"]),
+      );
+      if (startNs === undefined || duration === undefined || duration < 0)
+        return [];
+      return [
+        {
+          name: String(
+            mapped(row, "name", ["name", "span_name", "SpanName"], "span") ??
+              "span",
+          ),
+          service: String(
+            mapped(
+              row,
+              "service",
+              ["service", "service_name", "ServiceName"],
+              "service",
+            ) ?? "service",
+          ),
+          id: String(
+            mapped(row, "spanId", ["spanId", "span_id", "SpanId"], "") ?? "",
+          ),
+          parent: String(
+            mapped(
+              row,
+              "parentSpanId",
+              ["parentSpanId", "parent_span_id", "ParentSpanId"],
+              "",
+            ) ?? "",
+          ),
+          startNs,
+          duration,
+          status: String(
+            mapped(
+              row,
+              "status",
+              ["status", "StatusCode", "status_code"],
+              "",
+            ) ?? "",
+          ),
+        },
+      ];
+    });
+    if (!spans.length)
+      return <MappingFeedback fields="startTime and durationMs" />;
     const origin = spans.reduce(
       (minimum, span) => (span.startNs < minimum ? span.startNs : minimum),
       spans[0].startNs,
@@ -141,6 +245,7 @@ export function Visualization({
     };
     return (
       <div className="waterfall">
+        <SkippedRows count={rows.length - spans.length} />
         <div className="waterfall-axis">
           <span>Service / operation</span>
           <div>
@@ -195,26 +300,54 @@ export function Visualization({
     );
   }
   if (kind === "heatmap") {
-    const cells = rows.map((row) => ({
-      time: String(pick(row, ["time", "timestamp"])),
-      bucket: number(
-        pick(row, [
+    const cells = rows.flatMap((row) => {
+      const time = timeMs(mapped(row, "time", ["time", "timestamp"]));
+      const bucket = numeric(
+        mapped(row, "bucket", [
           "bucket",
           "latency_bucket_ms",
           "latency_ms",
           "duration_bucket",
           "bucket_ms",
         ]),
-      ),
-      count: number(pick(row, ["count", "value"])),
-    }));
-    const start = Math.floor(Date.parse(result.query.from) / 60000) * 60000;
+      );
+      const count = numeric(mapped(row, "count", ["count", "value"]));
+      return time === undefined ||
+        bucket === undefined ||
+        count === undefined ||
+        count < 0
+        ? []
+        : [{ time, bucket, count }];
+    });
+    if (!cells.length)
+      return <MappingFeedback fields="time, bucket, and count" />;
+    const timeBucket =
+      positive(mapping.timeBucketMs) ??
+      (sqlQuery ? (spacing(cells.map((cell) => cell.time)) ?? 60000) : 60000);
+    const valueBucket =
+      positive(mapping.valueBucketSize) ??
+      (sqlQuery ? (spacing(cells.map((cell) => cell.bucket)) ?? 1) : 50);
+    const start =
+      presetBounds?.from !== undefined
+        ? Math.floor(presetBounds.from / timeBucket) * timeBucket
+        : Math.min(...cells.map((cell) => cell.time));
     const end = Math.max(
-      start + 60000,
-      Math.ceil(Date.parse(result.query.to) / 60000) * 60000,
+      start + timeBucket,
+      presetBounds?.to !== undefined
+        ? Math.ceil(presetBounds.to / timeBucket) * timeBucket
+        : Math.max(...cells.map((cell) => cell.time)) + timeBucket,
     );
-    const topBucket = Math.max(...cells.map((cell) => cell.bucket + 50), 50);
+    const bottomBucket = sqlQuery
+      ? Math.min(...cells.map((cell) => cell.bucket))
+      : Math.min(...cells.map((cell) => cell.bucket), 0);
+    const topBucket = Math.max(
+      ...cells.map((cell) => cell.bucket + valueBucket),
+      bottomBucket + valueBucket,
+    );
+    const bucketRange = topBucket - bottomBucket;
     const maximum = Math.max(...cells.map((cell) => cell.count), 1);
+    const latency = template === "latency_heatmap";
+    const unit = latency ? " ms" : "";
     const w = 900,
       h = compact ? 200 : 280,
       left = 65,
@@ -222,19 +355,19 @@ export function Visualization({
       top = 10;
     const plotW = w - left - 20,
       plotH = h - bottom - top;
-    const cellW = (plotW * 60000) / (end - start),
-      cellH = (plotH * 50) / topBucket;
+    const cellW = (plotW * timeBucket) / (end - start),
+      cellH = (plotH * valueBucket) / bucketRange;
     return (
       <div className="chart-wrap">
+        <SkippedRows count={rows.length - cells.length} />
         <svg
           className="chart"
           viewBox={`0 0 ${w} ${h}`}
           role="img"
-          aria-label="Latency heatmap with one-minute time buckets and 50 millisecond latency buckets"
+          aria-label={latency ? "Latency heatmap" : "Query result heatmap"}
         >
           <title>
-            Root span latency distribution over time; empty cells have no
-            returned observations
+            {`${latency ? "Root span latency distribution over time" : "Query result distribution over time"}; empty cells have no returned observations`}
           </title>
           <rect x={left} y={top} width={plotW} height={plotH} fill="#f8f9fb" />
           {[0, 0.25, 0.5, 0.75, 1].map((tick) => (
@@ -244,7 +377,8 @@ export function Visualization({
                 y={top + plotH * (1 - tick) + 4}
                 textAnchor="end"
               >
-                {formatNumber(topBucket * tick)} ms
+                {formatNumber(bottomBucket + bucketRange * tick)}
+                {unit}
               </text>
               <line
                 x1={left}
@@ -256,9 +390,11 @@ export function Visualization({
             </g>
           ))}
           {cells.map((cell, index) => {
-            const x =
-              left + (plotW * (Date.parse(cell.time) - start)) / (end - start);
-            const y = top + plotH * (1 - (cell.bucket + 50) / topBucket);
+            const x = left + (plotW * (cell.time - start)) / (end - start);
+            const y =
+              top +
+              plotH *
+                (1 - (cell.bucket + valueBucket - bottomBucket) / bucketRange);
             return (
               <rect
                 key={index}
@@ -269,7 +405,7 @@ export function Visualization({
                 rx={Math.min(2, cellH / 5)}
                 fill={`rgba(244, 129, 32, ${0.15 + (0.85 * Math.log1p(cell.count)) / Math.log1p(maximum)})`}
               >
-                <title>{`${timeLabel(cell.time)} UTC · ${cell.bucket}–${cell.bucket + 50} ms · ${cell.count} spans`}</title>
+                <title>{`${timeLabel(cell.time)} UTC · ${cell.bucket}–${cell.bucket + valueBucket}${unit} · ${cell.count} ${latency ? "spans" : "observations"}`}</title>
               </rect>
             );
           })}
@@ -280,14 +416,17 @@ export function Visualization({
               y={h - 12}
               textAnchor="middle"
             >
-              {timeLabel(new Date(start + (end - start) * tick).toISOString())}
+              {timeLabel(start + (end - start) * tick)}
             </text>
           ))}
         </svg>
         <div className="chart-legend">
-          <span>1 min × 50 ms buckets · UTC</span>
+          <span>
+            {formatNumber(timeBucket / 1000)} s × {formatNumber(valueBucket)}
+            {unit} buckets · UTC
+          </span>
           <span className="heatmap-key">
-            Fewer <i /> More spans
+            Fewer <i /> More {latency ? "spans" : "observations"}
           </span>
         </div>
       </div>
@@ -296,7 +435,7 @@ export function Visualization({
   if (
     rows.length === 1 &&
     rows[0].time === undefined &&
-    result.query.template === "error_rate"
+    template === "error_rate"
   )
     return (
       <div className="aggregate-metric">
@@ -311,39 +450,71 @@ export function Visualization({
         </p>
       </div>
     );
-  const groupKey = rows.some(
-    (row) =>
-      row.service !== undefined ||
-      row.service_name !== undefined ||
-      row.ServiceName !== undefined,
-  )
-    ? ["service", "service_name", "ServiceName"]
-    : [];
-  const series = [
-    ...new Set(
-      rows.map((row) =>
-        String(
-          pick(
-            row,
-            groupKey,
-            result.query.template === "error_rate"
-              ? "Error rate (%)"
-              : "Requests / second",
-          ),
-        ),
-      ),
-    ),
-  ];
-  const points = rows.map((row) => ({
-    time: String(pick(row, ["time", "timestamp", "bucket"])),
-    value: number(
-      pick(row, ["value", "rate", "count", "error_rate", "requests"]),
-    ),
-    series: String(pick(row, groupKey, series[0])),
-  }));
-  const start = Math.floor(Date.parse(result.query.from) / 60000) * 60000;
-  const end = Math.max(start + 60000, Date.parse(result.query.to));
-  const max = Math.max(...points.map((point) => point.value), 1) * 1.15;
+  const defaultSeries = sqlQuery
+    ? "Value"
+    : template === "error_rate"
+      ? "Error rate (%)"
+      : "Requests / second";
+  const points = rows.flatMap((row) => {
+    const time = timeMs(mapped(row, "time", ["time", "timestamp", "bucket"]));
+    const value = numeric(
+      mapped(row, "value", [
+        "value",
+        "rate",
+        "count",
+        "error_rate",
+        "requests",
+      ]),
+    );
+    return time === undefined || value === undefined
+      ? []
+      : [
+          {
+            time,
+            value,
+            series: String(
+              mapped(
+                row,
+                "series",
+                ["series", "service", "service_name", "ServiceName"],
+                defaultSeries,
+              ) ?? defaultSeries,
+            ),
+          },
+        ];
+  });
+  if (!points.length)
+    return <MappingFeedback fields="time and value (and an optional series)" />;
+  const series = [...new Set(points.map((point) => point.series))];
+  // Infer each series independently so interleaved series do not create false gaps.
+  const intervals = series.flatMap((name) => {
+    const interval = spacing(
+      points
+        .filter((point) => point.series === name)
+        .map((point) => point.time),
+    );
+    return interval === undefined ? [] : [interval];
+  });
+  const timeBucket =
+    positive(mapping.timeBucketMs) ??
+    (sqlQuery
+      ? intervals.length
+        ? Math.min(...intervals)
+        : undefined
+      : 60000);
+  const start =
+    presetBounds?.from !== undefined
+      ? Math.floor(presetBounds.from / 60000) * 60000
+      : Math.min(...points.map((point) => point.time));
+  const end = Math.max(
+    start + (timeBucket ?? 60000),
+    presetBounds?.to ?? Math.max(...points.map((point) => point.time)),
+  );
+  const minValue = Math.min(...points.map((point) => point.value), 0);
+  const maxValue = Math.max(...points.map((point) => point.value), 0);
+  const padding = (maxValue - minValue || 1) * 0.15;
+  const min = minValue < 0 ? minValue - padding : 0;
+  const max = maxValue > 0 ? maxValue + padding : minValue < 0 ? 0 : 1;
   const w = 900,
     h = compact ? 220 : 310,
     left = 52,
@@ -352,18 +523,21 @@ export function Visualization({
     bottom = 38,
     plotW = w - left - right,
     plotH = h - top - bottom;
-  const xAt = (time: string) =>
-    left + ((Date.parse(time) - start) / (end - start)) * plotW;
-  const yAt = (value: number) => top + plotH * (1 - value / max);
+  const xAt = (time: number) => left + ((time - start) / (end - start)) * plotW;
+  const yAt = (value: number) =>
+    top + plotH * (1 - (value - min) / (max - min));
   return (
     <div className="chart-wrap">
+      <SkippedRows count={rows.length - points.length} />
       <svg
         className="chart"
         viewBox={`0 0 ${w} ${h}`}
         role="img"
-        aria-label={`${result.query.template === "error_rate" ? "Error rate" : "Span volume"} over time`}
+        aria-label={`${sqlQuery ? "Query results" : template === "error_rate" ? "Error rate" : "Span volume"} over time`}
       >
-        <title>{result.query.template.replaceAll("_", " ")}</title>
+        <title>
+          {template?.replaceAll("_", " ") ?? "SQL query results over time"}
+        </title>
         <defs>
           {series.map((_, index) => (
             <linearGradient
@@ -392,26 +566,34 @@ export function Visualization({
             <line
               x1={left}
               x2={w - right}
-              y1={yAt(max * tick)}
-              y2={yAt(max * tick)}
+              y1={yAt(min + (max - min) * tick)}
+              y2={yAt(min + (max - min) * tick)}
               stroke="#e7e9ed"
               strokeDasharray={tick ? "3 4" : undefined}
             />
-            <text x={left - 12} y={yAt(max * tick) + 4} textAnchor="end">
-              {formatNumber(max * tick)}
+            <text
+              x={left - 12}
+              y={yAt(min + (max - min) * tick) + 4}
+              textAnchor="end"
+            >
+              {formatNumber(min + (max - min) * tick)}
             </text>
           </g>
         ))}
         {series.map((name, index) => {
           const group = points
             .filter((point) => point.series === name)
-            .sort((a, b) => a.time.localeCompare(b.time));
+            .sort((a, b) => a.time - b.time);
+          const gap =
+            positive(mapping.timeBucketMs) ??
+            (sqlQuery ? spacing(group.map((point) => point.time)) : 60000);
           const segments: (typeof points)[] = [];
           for (const point of group) {
             const previous = segments.at(-1)?.at(-1);
             if (
               !previous ||
-              Date.parse(point.time) - Date.parse(previous.time) > 60001
+              (gap !== undefined &&
+                point.time - previous.time > gap + Math.max(1, gap * 0.001))
             )
               segments.push([point]);
             else segments[segments.length - 1].push(point);
@@ -428,7 +610,7 @@ export function Visualization({
                 return (
                   <g key={segmentIndex}>
                     <path
-                      d={`${path} L${xAt(segment.at(-1)!.time)},${top + plotH} L${xAt(segment[0].time)},${top + plotH} Z`}
+                      d={`${path} L${xAt(segment.at(-1)!.time)},${yAt(0)} L${xAt(segment[0].time)},${yAt(0)} Z`}
                       fill={`url(#area-${compact ? "compact" : "full"}-${index})`}
                     />
                     <path
@@ -464,7 +646,7 @@ export function Visualization({
             key={tick}
             textAnchor="middle"
           >
-            {timeLabel(new Date(start + (end - start) * tick).toISOString())}
+            {timeLabel(start + (end - start) * tick)}
           </text>
         ))}
       </svg>

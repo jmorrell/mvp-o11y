@@ -1,5 +1,5 @@
-import type { QueryResult, QuerySpec } from "../shared/types";
-export function previewResult(query: QuerySpec): QueryResult {
+import type { QueryResult, PresetQuerySpec } from "../shared/types";
+export function previewResult(query: PresetQuerySpec): QueryResult {
   const from = new Date(query.from).valueOf(),
     to = new Date(query.to).valueOf();
   const time = (index: number) =>

@@ -19,9 +19,10 @@ export class ClickHouseError extends Error {
     super(`ClickHouse ${reason} (${status})`);
   }
 }
+export class ClickHouseConfigurationError extends Error {}
 function endpoint(env: Env): URL {
-  if (!env.CLICKHOUSE_URL || !env.CLICKHOUSE_PASSWORD)
-    throw new Error("ClickHouse is not configured");
+  if (!env.CLICKHOUSE_URL)
+    throw new ClickHouseConfigurationError("ClickHouse is not configured");
   const url = new URL(env.CLICKHOUSE_URL);
   if (
     url.protocol !== "https:" &&
@@ -34,10 +35,28 @@ function endpoint(env: Env): URL {
   url.searchParams.set("session_timezone", "UTC");
   return url;
 }
-function headers(env: Env): HeadersInit {
+function headers(env: Env, query = false, required = false): HeadersInit {
+  const queryCredentials =
+    !!env.CLICKHOUSE_QUERY_USER && !!env.CLICKHOUSE_QUERY_PASSWORD;
+  if (
+    query &&
+    (required || env.CLICKHOUSE_QUERY_USER || env.CLICKHOUSE_QUERY_PASSWORD) &&
+    !queryCredentials
+  )
+    throw new ClickHouseConfigurationError(
+      "Configure CLICKHOUSE_QUERY_USER and CLICKHOUSE_QUERY_PASSWORD with the SELECT-only account in clickhouse/query-user.sql before running SQL",
+    );
+  const useQueryCredentials = query && queryCredentials;
+  const password = useQueryCredentials
+    ? env.CLICKHOUSE_QUERY_PASSWORD!
+    : env.CLICKHOUSE_PASSWORD;
+  if (!password)
+    throw new ClickHouseConfigurationError("ClickHouse is not configured");
   return {
-    "X-ClickHouse-User": env.CLICKHOUSE_USER || "default",
-    "X-ClickHouse-Key": env.CLICKHOUSE_PASSWORD,
+    "X-ClickHouse-User": useQueryCredentials
+      ? env.CLICKHOUSE_QUERY_USER!
+      : env.CLICKHOUSE_USER || "default",
+    "X-ClickHouse-Key": password,
     "Content-Type": "text/plain; charset=utf-8",
   };
 }
@@ -45,13 +64,40 @@ function headers(env: Env): HeadersInit {
 async function responseText(
   response: Response,
   maximumBytes: number,
+  env?: Env,
 ): Promise<string> {
   if (
     !response.ok ||
     Number(response.headers.get("X-ClickHouse-Exception-Code")) > 0
   ) {
-    await response.body?.cancel();
-    throw new ClickHouseError(response.status);
+    // Syntax/type/access errors are useful to SQL callers. Keep a bounded prefix and
+    // remove configured credentials before returning the server's diagnostic.
+    const reader = response.body?.getReader();
+    let message = "";
+    if (reader) {
+      let remaining = 4096;
+      const decoder = new TextDecoder();
+      try {
+        while (remaining > 0) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          message += decoder.decode(value.subarray(0, remaining), {
+            stream: true,
+          });
+          remaining -= value.byteLength;
+        }
+        message += decoder.decode();
+      } catch {
+        /* Use the status when the server disconnected. */
+      } finally {
+        await reader.cancel().catch(() => {});
+        reader.releaseLock();
+      }
+    }
+    throw new ClickHouseError(
+      response.status,
+      sanitizeDiagnostic(message, env) || "request failed",
+    );
   }
   if (Number(response.headers.get("Content-Length")) > maximumBytes) {
     await response.body?.cancel();
@@ -90,6 +136,22 @@ async function responseText(
   }
 }
 
+function sanitizeDiagnostic(message: string, env?: Env): string {
+  for (const secret of [
+    env?.CLICKHOUSE_PASSWORD,
+    env?.CLICKHOUSE_QUERY_PASSWORD,
+  ]) {
+    if (secret) message = message.split(secret).join("[redacted]");
+  }
+  // ClickHouse includes the query and a native stack trace after these markers.
+  // Its first diagnostic retains the actionable column/type/syntax information.
+  return message
+    .split(/\n(?:Stack trace|\(query:)/, 1)[0]
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "")
+    .trim()
+    .slice(0, 2048);
+}
+
 function bufferResponse(url: URL, bytes: number): void {
   // Status 200 alone cannot confirm execution: ClickHouse may append an exception after headers.
   url.searchParams.set("wait_end_of_query", "1");
@@ -104,25 +166,35 @@ export async function queryRows(
   env: Env,
   sql: string,
   parameters: Record<string, string | number>,
+  options: { requireQueryCredentials?: boolean } = {},
 ): Promise<{ rows: Record<string, unknown>[]; columns: string[] }> {
   const url = endpoint(env);
+  const requestHeaders = headers(env, true, options.requireQueryCredentials);
   for (const [name, value] of Object.entries(parameters))
     url.searchParams.set(`param_${name}`, String(value));
   url.searchParams.set("readonly", "1");
   url.searchParams.set("max_execution_time", "20");
   url.searchParams.set("max_result_rows", String(MAX_QUERY_ROWS));
   url.searchParams.set("max_result_bytes", String(MAX_QUERY_BYTES));
+  url.searchParams.set("limit", String(MAX_QUERY_ROWS));
+  url.searchParams.set("max_memory_usage", "500000000");
+  url.searchParams.set("max_rows_to_read", "100000000");
+  url.searchParams.set("max_bytes_to_read", "10000000000");
   url.searchParams.set("result_overflow_mode", "throw");
+  url.searchParams.set("timeout_overflow_mode", "throw");
+  url.searchParams.set("default_format", "JSON");
   url.searchParams.set("output_format_json_quote_64bit_integers", "1");
   bufferResponse(url, MAX_QUERY_BYTES);
   const response = await fetch(url, {
     method: "POST",
-    headers: headers(env),
-    body: `${sql}\nFORMAT JSON`,
+    headers: requestHeaders,
+    // Keep SQL intact: appending FORMAT breaks trailing semicolons/comments.
+    // ClickHouse parses one statement; default_format selects JSON for its result.
+    body: sql,
     signal: AbortSignal.timeout(25_000),
     redirect: "manual",
   });
-  const text = await responseText(response, MAX_QUERY_BYTES);
+  const text = await responseText(response, MAX_QUERY_BYTES, env);
   let result: {
     data: Record<string, unknown>[];
     meta: { name: string }[];
@@ -133,11 +205,24 @@ export async function queryRows(
   } catch {
     throw new ClickHouseError(
       response.status,
-      "returned invalid JSON or an execution error",
+      "returned invalid JSON or an execution error; omit FORMAT or use FORMAT JSON",
     );
   }
-  if (!result || typeof result !== "object" || "exception" in result) {
-    throw new ClickHouseError(response.status, "reported an execution error");
+  if (!result || typeof result !== "object") {
+    throw new ClickHouseError(
+      response.status,
+      "returned an invalid result shape; omit FORMAT or use FORMAT JSON",
+    );
+  }
+  if ("exception" in result) {
+    const diagnostic =
+      typeof result.exception === "string"
+        ? sanitizeDiagnostic(result.exception, env)
+        : "";
+    throw new ClickHouseError(
+      response.status,
+      `reported an execution error${diagnostic ? `: ${diagnostic}` : ""}`,
+    );
   }
   if (
     !Array.isArray(result.data) ||
@@ -154,7 +239,7 @@ export async function queryRows(
   ) {
     throw new ClickHouseError(
       response.status,
-      "returned an invalid result shape",
+      "returned an invalid result shape; omit FORMAT or use FORMAT JSON",
     );
   }
   if (result.data.length > MAX_QUERY_ROWS)
@@ -190,7 +275,7 @@ export async function insertRows(
     redirect: "manual",
   });
   // Successful INSERT without RETURNING has an empty body. Read to completion before acknowledging K2.
-  if ((await responseText(response, 65_536)).trim() !== "") {
+  if ((await responseText(response, 65_536, env)).trim() !== "") {
     throw new ClickHouseError(
       response.status,
       "returned an unexpected insert response or execution error",

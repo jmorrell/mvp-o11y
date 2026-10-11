@@ -16,7 +16,10 @@ import {
   deleteAlert,
   updateAlert,
 } from "../src/worker/alerts";
-import { ClickHouseError } from "../src/worker/clickhouse";
+import {
+  ClickHouseError,
+  ClickHouseConfigurationError,
+} from "../src/worker/clickhouse";
 
 vi.mock("../src/worker/ingest", () => ({ ingest: vi.fn() }));
 vi.mock("../src/worker/k2", () => ({ pollK2: vi.fn() }));
@@ -261,6 +264,44 @@ describe("Worker HTTP authentication and error boundaries", () => {
     expect(upstream.status).toBe(502);
     expect(await upstream.json()).toEqual({
       error: "ClickHouse request failed (500)",
+    });
+  });
+
+  it("accepts arbitrary SQL through REST and reports missing query credentials", async () => {
+    const query = {
+      sql: "WITH a AS (SELECT 4 AS n) SELECT sum(n) AS total FROM a;",
+      parameters: {},
+      limit: 100,
+    };
+    vi.mocked(runQuery).mockImplementation(async (_env, input) => ({
+      query: querySchema.parse(input),
+      sql: query.sql,
+      parameters: {},
+      columns: ["total"],
+      rows: [{ total: 4 }],
+      executedAt: "2026-10-11T00:00:00Z",
+      truncated: false,
+    }));
+    const init = {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(query),
+    };
+    const response = await call("/api/query", env.API_TOKEN, init);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      sql: query.sql,
+      rows: [{ total: 4 }],
+    });
+    vi.mocked(runQuery).mockRejectedValue(
+      new ClickHouseConfigurationError(
+        "Configure the SELECT-only query account",
+      ),
+    );
+    const missing = await call("/api/query", env.API_TOKEN, init);
+    expect(missing.status).toBe(503);
+    expect(await missing.json()).toEqual({
+      error: "Configure the SELECT-only query account",
     });
   });
 

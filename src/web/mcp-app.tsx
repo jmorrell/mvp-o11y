@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import { App, applyHostStyleVariables } from "@modelcontextprotocol/ext-apps";
 import { Visualization } from "./Visualization";
 import type { Snapshot } from "../shared/types";
+import { isSqlQuery } from "../shared/types";
 import "./styles.css";
 
 const app = new App({ name: "mvp-o11y-visualization", version: "0.1.0" }, {});
@@ -123,10 +124,13 @@ function SnapshotApp() {
             <Visualization
               result={snapshot}
               kind={table ? "table" : snapshot.visualization}
+              mapping={snapshot.mapping}
             />
             <div className="result-meta">
               <span>
-                {snapshot.query.from} → {snapshot.query.to}
+                {isSqlQuery(snapshot.query)
+                  ? "SQL query · preserved result"
+                  : `${snapshot.query.from} → ${snapshot.query.to}`}
               </span>
               <span>
                 {snapshot.rows.length.toLocaleString()} rows

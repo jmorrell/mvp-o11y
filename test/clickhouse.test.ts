@@ -98,6 +98,73 @@ describe("ClickHouse execution confirmation", () => {
     expect(url.searchParams.get("max_result_bytes")).toBe("10000000");
     expect(url.searchParams.get("wait_end_of_query")).toBe("1");
     expect(url.searchParams.get("buffer_size")).toBe("10000000");
+    expect(url.searchParams.get("default_format")).toBe("JSON");
+    expect(url.searchParams.get("limit")).toBe("10001");
+  });
+
+  it("uses the dedicated account for queries, preserves SQL, and keeps ingestion credentials for writes", async () => {
+    const fetchMock = respond(
+      Response.json({ meta: [{ name: "value" }], data: [{ value: 1 }] }),
+    );
+    const configured = {
+      ...env,
+      CLICKHOUSE_QUERY_USER: "o11y_query",
+      CLICKHOUSE_QUERY_PASSWORD: "query-secret",
+    };
+    const sql =
+      "WITH x AS (SELECT {value:UInt32} AS value) SELECT * FROM x; -- trailing comment";
+    await queryRows(
+      configured,
+      sql,
+      { value: 1 },
+      { requireQueryCredentials: true },
+    );
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(init.body).toBe(sql);
+    expect(url.searchParams.get("param_value")).toBe("1");
+    expect(new Headers(init.headers).get("X-ClickHouse-User")).toBe(
+      "o11y_query",
+    );
+    expect(new Headers(init.headers).get("X-ClickHouse-Key")).toBe(
+      "query-secret",
+    );
+    const write = respond(new Response(""));
+    await insertRows(configured, "otel_logs", [{}], "test");
+    expect(
+      new Headers(write.mock.calls[0][1].headers).get("X-ClickHouse-Key"),
+    ).toBe("private-password");
+  });
+
+  it("returns bounded useful SQL diagnostics with configured credentials removed", async () => {
+    respond(
+      new Response(
+        "Code: 47. DB::Exception: Unknown expression missing_column. private-password query-secret\nStack trace:\ninternal",
+        { status: 400 },
+      ),
+    );
+    await expect(
+      queryRows(
+        {
+          ...env,
+          CLICKHOUSE_QUERY_USER: "o11y_query",
+          CLICKHOUSE_QUERY_PASSWORD: "query-secret",
+        },
+        "SELECT missing_column",
+        {},
+      ),
+    ).rejects.toThrow(
+      "Unknown expression missing_column. [redacted] [redacted]",
+    );
+    respond(
+      new Response("Code: 62. Syntax error. " + "x".repeat(10_000), {
+        status: 400,
+      }),
+    );
+    const error = await queryRows(env, "SELECT ?", {}).catch(
+      (error: Error) => error,
+    );
+    expect(error).toBeInstanceOf(ClickHouseError);
+    expect((error as Error).message.length).toBeLessThan(2100);
   });
 
   it("rejects a syntactically valid JSON result containing a ClickHouse exception", async () => {

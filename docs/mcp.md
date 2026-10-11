@@ -7,22 +7,22 @@ SSE subscriptions are not offered. Each request is authenticated by the Worker.
 This MVP uses a shared bearer token; OAuth discovery and per-user permissions are
 not implemented. Use a client that supports custom authorization headers.
 
-| Tool | Behavior |
-| --- | --- |
-| `list_query_templates` | Describes the five parameterized query templates. |
-| `run_query` | Returns ordered ClickHouse rows and query provenance. |
-| `create_visualization` | Executes a query, saves an immutable R2 snapshot, and displays an MCP App. |
-| `get_visualization` | Displays saved rows without rerunning the query. |
-| `list_visualizations` | Lists snapshot metadata and permanent URLs, with a pagination cursor. |
-| `create_alert` | Saves a threshold rule and its webhook destination. |
-| `list_alerts` | Lists rules and their last evaluation/trigger timestamps. |
-| `update_alert` | Updates selected fields using `{id, changes}`; `enabled: false` pauses evaluations. |
-| `delete_alert` | Deletes the rule and cancels queued deliveries. |
+| Tool                   | Behavior                                                                                                 |
+| ---------------------- | -------------------------------------------------------------------------------------------------------- |
+| `list_query_templates` | Describes five optional starter presets.                                                                 |
+| `describe_schema`      | Lists available tables, columns, and ClickHouse types before composing SQL.                              |
+| `run_query`            | Executes arbitrary read-only SQL with typed bound parameters, returning rows and exact query provenance. |
+| `create_visualization` | Executes a query, saves an immutable R2 snapshot, and displays an MCP App.                               |
+| `get_visualization`    | Displays saved rows without rerunning the query.                                                         |
+| `list_visualizations`  | Lists snapshot metadata and permanent URLs, with a pagination cursor.                                    |
+| `create_alert`         | Saves a threshold rule and its webhook destination.                                                      |
+| `list_alerts`          | Lists rules and their last evaluation/trigger timestamps.                                                |
+| `update_alert`         | Updates selected fields using `{id, changes}`; `enabled: false` pauses evaluations.                      |
+| `delete_alert`         | Deletes the rule and cancels queued deliveries.                                                          |
 
-Queries use absolute ISO 8601 `from` and `to` timestamps and a `[from, to)` window.
-They are parameterized and ordered. Late telemetry can change a later execution
-of the same query; a saved visualization permanently preserves the exact returned
-rows, SQL, bound parameters, execution time, checksum, and row-limit indicator.
+Queries accept `{sql, parameters?, limit?}`. ClickHouse executes the SQL directly, including CTEs, joins, aggregates, and window functions. Use `describe_schema` or `run_query` with `DESCRIBE TABLE otel_traces` to inspect columns. Typed placeholders such as `{service:String}` bind values safely. Queries can use any retained time range; use explicit absolute parameters and `ORDER BY` when repeatable selection matters.
+
+Late telemetry or nondeterministic functions can change a later execution of the same SQL. A saved visualization permanently preserves the exact returned rows, SQL, bound parameters, column mapping, execution time, checksum, and row-limit indicator.
 Snapshot URLs are stable and use the same dashboard authentication.
 
 For example, call `create_visualization` with:
@@ -32,12 +32,15 @@ For example, call `create_visualization` with:
   "title": "Checkout request rate",
   "visualization": "line",
   "query": {
-    "template": "request_rate",
-    "from": "2026-10-11T12:00:00Z",
-    "to": "2026-10-11T13:00:00Z",
-    "service": "checkout",
+    "sql": "SELECT toStartOfMinute(Timestamp) AS minute, count() / 60.0 AS requests_per_second FROM otel_traces WHERE ServiceName = {service:String} AND Timestamp >= parseDateTime64BestEffort({from:String}, 9, 'UTC') AND Timestamp < parseDateTime64BestEffort({to:String}, 9, 'UTC') GROUP BY minute ORDER BY minute",
+    "parameters": {
+      "service": "checkout",
+      "from": "2026-10-11T12:00:00Z",
+      "to": "2026-10-11T13:00:00Z"
+    },
     "limit": 1000
-  }
+  },
+  "mapping": { "time": "minute", "value": "requests_per_second" }
 }
 ```
 
@@ -57,6 +60,8 @@ as a Worker secret. Destinations must use HTTPS, the default port, no URL
 credentials, and an allowed hostname. IP literals, local hostnames, and redirects
 are rejected. Only configure hosts you control or explicitly trust; the allowlist
 is the outbound trust boundary.
+
+Rules can supply arbitrary SQL, custom parameters, and `valueColumn` (default `value`). SQL must return exactly one row with a numeric value. Reserved `from` and `to` parameters are bound to the current window; custom parameters cannot replace them. See [SQL alert examples](sql-alerts.md).
 
 Rules run from the minute cron trigger using absolute windows ending on a minute
 boundary. `request_rate` compares average root spans per second across the full

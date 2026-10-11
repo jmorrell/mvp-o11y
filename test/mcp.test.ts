@@ -80,10 +80,11 @@ describe("MCP over real stateless Streamable HTTP", () => {
     vi.clearAllMocks();
   });
 
-  it("initializes, lists nine tools, and advertises MCP Apps metadata", async () => {
+  it("initializes, lists ten tools, and advertises MCP Apps metadata", async () => {
     const result = await client.listTools();
     expect(result.tools.map((tool) => tool.name)).toEqual([
       "list_query_templates",
+      "describe_schema",
       "run_query",
       "create_visualization",
       "get_visualization",
@@ -129,6 +130,73 @@ describe("MCP over real stateless Streamable HTTP", () => {
     });
     expect(saved.structuredContent).toEqual({ snapshot });
     expect(runQuery).not.toHaveBeenCalled();
+  });
+
+  it("advertises SQL inputs and forwards CTEs and typed parameters without rewriting", async () => {
+    const tools = await client.listTools();
+    const queryTool = tools.tools.find((tool) => tool.name === "run_query")!;
+    expect(queryTool.inputSchema.properties).toHaveProperty("sql");
+    expect(queryTool.inputSchema.properties).toHaveProperty("parameters");
+    const query = {
+      sql: "WITH services AS (SELECT ServiceName FROM otel_traces) SELECT ServiceName, count() AS requests FROM services WHERE ServiceName = {service:String} GROUP BY ServiceName ORDER BY requests DESC; -- keep exact SQL",
+      parameters: { service: "checkout" },
+      limit: 50,
+    };
+    const result = await client.callTool({
+      name: "run_query",
+      arguments: query,
+    });
+    expect(result.isError).not.toBe(true);
+    expect(runQuery).toHaveBeenCalledWith(env, query);
+    const invalid = await client.callTool({
+      name: "run_query",
+      arguments: { ...query, template: "request_rate" },
+    });
+    expect(invalid.isError).toBe(true);
+  });
+
+  it("saves arbitrary SQL with column mapping in an MCP App snapshot", async () => {
+    const sqlSnapshot: Snapshot = {
+      ...snapshot,
+      query: { sql: "SELECT now() AS observed, 7 AS measured" },
+      sql: "SELECT now() AS observed, 7 AS measured",
+      mapping: { time: "observed", value: "measured" },
+      columns: ["observed", "measured"],
+      rows: [{ observed: "2026-10-11T00:00:00Z", measured: 7 }],
+    };
+    vi.mocked(saveSnapshot).mockResolvedValue(sqlSnapshot);
+    const result = await client.callTool({
+      name: "create_visualization",
+      arguments: {
+        title: sqlSnapshot.title,
+        query: sqlSnapshot.query,
+        visualization: "line",
+        mapping: sqlSnapshot.mapping,
+      },
+    });
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toEqual({ snapshot: sqlSnapshot });
+    expect(saveSnapshot).toHaveBeenCalledWith(
+      env,
+      expect.objectContaining({
+        mapping: sqlSnapshot.mapping,
+        query: expect.objectContaining({ sql: sqlSnapshot.sql }),
+      }),
+    );
+  });
+
+  it("discovers tables and columns before composing arbitrary SQL", async () => {
+    const result = await client.callTool({
+      name: "describe_schema",
+      arguments: {},
+    });
+    expect(result.isError).not.toBe(true);
+    expect(runQuery).toHaveBeenCalledWith(
+      env,
+      expect.objectContaining({
+        sql: expect.stringContaining("FROM system.columns"),
+      }),
+    );
   });
 
   it("serves the bundled app resource with a network-free CSP and no credentials", async () => {

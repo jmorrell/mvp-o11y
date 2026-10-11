@@ -13,7 +13,7 @@ import {
 } from "./alerts";
 import { handleMcp } from "./mcp";
 import { ZodError } from "zod";
-import { ClickHouseError } from "./clickhouse";
+import { ClickHouseError, ClickHouseConfigurationError } from "./clickhouse";
 
 export function json(value: unknown, status = 200): Response {
   return Response.json(value, {
@@ -170,6 +170,8 @@ export default {
         return json({ error: error.message }, error.status);
       if (error instanceof RequestError)
         return json({ error: error.message }, error.status);
+      if (error instanceof ClickHouseConfigurationError)
+        return json({ error: error.message }, 503);
       if (error instanceof ClickHouseError)
         return json({ error: error.message }, 502);
       // Upstream exception messages may contain credentials or telemetry payloads.

@@ -13,6 +13,8 @@ export interface Env {
   CLICKHOUSE_DATABASE: string;
   CLICKHOUSE_USER: string;
   CLICKHOUSE_PASSWORD: string;
+  CLICKHOUSE_QUERY_USER?: string;
+  CLICKHOUSE_QUERY_PASSWORD?: string;
   K2_STREAM_ID?: string;
   K2_SUBSCRIPTION_ID?: string;
   K2_API_TOKEN?: string;

@@ -2,6 +2,25 @@ import { z } from "zod";
 import type { Snapshot } from "../shared/types";
 import type { Env } from "./env";
 import { querySchema, runQuery } from "./queries";
+const column = z.string().min(1).max(256).optional();
+export const visualizationMappingSchema = z
+  .object({
+    time: column,
+    value: column,
+    series: column,
+    bucket: column,
+    count: column,
+    spanId: column,
+    parentSpanId: column,
+    name: column,
+    service: column,
+    startTime: column,
+    durationMs: column,
+    status: column,
+    timeBucketMs: z.number().positive().finite().optional(),
+    valueBucketSize: z.number().positive().finite().optional(),
+  })
+  .strict();
 const allowedVisualizations: Record<string, string[]> = {
   request_rate: ["line", "table"],
   latency_heatmap: ["heatmap", "table"],
@@ -14,10 +33,12 @@ export const snapshotSchema = z
     query: querySchema,
     title: z.string().trim().min(1).max(160),
     visualization: z.enum(["line", "waterfall", "heatmap", "table"]),
+    mapping: visualizationMappingSchema.optional(),
   })
   .strict()
   .superRefine((spec, ctx) => {
     if (
+      "template" in spec.query &&
       !allowedVisualizations[spec.query.template].includes(spec.visualization)
     )
       ctx.addIssue({
@@ -32,6 +53,38 @@ export async function saveSnapshot(
 ): Promise<Snapshot> {
   const spec = snapshotSchema.parse(input);
   const result = await runQuery(env, spec.query);
+  const issues: z.core.$ZodIssue[] = [];
+  for (const [field, name] of Object.entries(spec.mapping ?? {})) {
+    if (typeof name === "string" && !result.columns.includes(name)) {
+      issues.push({
+        code: "custom",
+        path: ["mapping", field],
+        message: `Column ${JSON.stringify(name)} is not present in the SQL result`,
+      });
+    }
+  }
+  if ("sql" in spec.query) {
+    const required = {
+      table: [],
+      line: ["time", "value"],
+      heatmap: ["time", "bucket", "count"],
+      waterfall: ["spanId", "name", "startTime", "durationMs"],
+    } as const;
+    for (const field of required[spec.visualization]) {
+      const name = spec.mapping?.[field] ?? field;
+      if (
+        !result.columns.includes(name) &&
+        !issues.some((issue) => issue.path[1] === field)
+      ) {
+        issues.push({
+          code: "custom",
+          path: ["mapping", field],
+          message: `${spec.visualization} requires a ${field} column; alias it as ${JSON.stringify(field)} or set mapping.${field}`,
+        });
+      }
+    }
+  }
+  if (issues.length) throw new z.ZodError(issues);
   const id = crypto.randomUUID();
   const createdAt = new Date().toISOString();
   const content = {
@@ -39,6 +92,7 @@ export async function saveSnapshot(
     id,
     title: spec.title,
     visualization: spec.visualization,
+    ...(spec.mapping ? { mapping: spec.mapping } : {}),
     createdAt,
     ...result,
   };

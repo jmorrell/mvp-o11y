@@ -20,6 +20,7 @@ jobs:
         image: clickhouse/clickhouse-server:26.3@sha256:55a55347b1b959ae51d40373901e81aa671d7fc9e6d05d0603d1e0ad3ac22c6d
         env:
           CLICKHOUSE_PASSWORD: local-test-only
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
         ports:
           - 8123:8123
         options: >-
@@ -36,7 +37,9 @@ jobs:
       - run: npm ci
       - name: Apply ClickStack schema
         run: docker exec -i "${{ job.services.clickhouse.id }}" clickhouse-client --password local-test-only --multiquery < clickhouse/schema.sql
+      - name: Provision restricted SQL query user
+        run: docker exec -i "${{ job.services.clickhouse.id }}" clickhouse-client --password local-test-only --database=default --param_query_password=local-query-only --multiquery < clickhouse/query-user.sql
       - name: Insert OTLP and query real ClickHouse
         run: npx vitest run test/clickhouse.integration.test.ts
         env:
-          CLICKHOUSE_INTEGRATION: '1'
+          CLICKHOUSE_INTEGRATION: "1"

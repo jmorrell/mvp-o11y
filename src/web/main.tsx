@@ -34,16 +34,21 @@ import type {
   AlertRule,
   QueryResult,
   QuerySpec,
+  PresetQuerySpec,
+  SqlQuerySpec,
   Snapshot,
   VisualizationKind,
+  VisualizationMapping,
 } from "../shared/types";
+import { isSqlQuery } from "../shared/types";
 import { Visualization, formatNumber } from "./Visualization";
 import { previewResult } from "./demo";
+import { alertSql, parseParameters, sqlExample } from "./sql";
 import "@cloudflare/kumo/styles/standalone";
 import "./styles.css";
 
 const templates: {
-  id: QuerySpec["template"];
+  id: PresetQuerySpec["template"];
   title: string;
   description: string;
   kind: VisualizationKind;
@@ -79,7 +84,7 @@ const templates: {
     kind: "line",
   },
 ];
-const initialQuery = (): QuerySpec => ({
+const initialQuery = (): PresetQuerySpec => ({
   template: "request_rate",
   from: new Date(Date.now() - 3600000).toISOString(),
   to: new Date().toISOString(),
@@ -95,7 +100,13 @@ const dateText = (value: string) =>
     hour12: false,
   });
 const templateFor = (query: QuerySpec) =>
-  templates.find((item) => item.id === query.template)!;
+  isSqlQuery(query)
+    ? {
+        title: "SQL query",
+        description: "Returned directly from your ClickHouse query",
+        kind: "table" as const,
+      }
+    : templates.find((item) => item.id === query.template)!;
 type Api = <T>(path: string, init?: RequestInit) => Promise<T>;
 type Summary = Pick<
   Snapshot,
@@ -389,7 +400,9 @@ function ResultMeta({ result }: { result: QueryResult }) {
     <div className="result-meta">
       <span>
         <Clock size={13} />
-        {dateText(result.query.from)} — {dateText(result.query.to)} UTC
+        {isSqlQuery(result.query)
+          ? `Executed ${dateText(result.executedAt)} UTC`
+          : `${dateText(result.query.from)} — ${dateText(result.query.to)} UTC`}
       </span>
       <span>
         {result.rows.length.toLocaleString()} rows
@@ -591,6 +604,114 @@ function Overview({
     </>
   );
 }
+function MappingFields({
+  kind,
+  columns,
+  mapping,
+  onChange,
+}: {
+  kind: VisualizationKind;
+  columns: string[];
+  mapping: VisualizationMapping;
+  onChange: (mapping: VisualizationMapping) => void;
+}) {
+  const fields: [keyof VisualizationMapping, string][] =
+    kind === "line"
+      ? [
+          ["time", "Time"],
+          ["value", "Value"],
+          ["series", "Series (optional)"],
+        ]
+      : kind === "heatmap"
+        ? [
+            ["time", "Time"],
+            ["bucket", "Bucket start"],
+            ["count", "Count"],
+          ]
+        : kind === "waterfall"
+          ? [
+              ["startTime", "Start time (UTC or epoch ms)"],
+              ["durationMs", "Duration (ms)"],
+              ["name", "Operation"],
+              ["service", "Service"],
+              ["spanId", "Span ID"],
+              ["parentSpanId", "Parent span ID"],
+              ["status", "Status"],
+            ]
+          : [];
+  if (!fields.length) return null;
+  return (
+    <details className="mapping-controls" open>
+      <summary>Chart columns</summary>
+      <div className="mapping-fields">
+        {fields.map(([field, label]) => (
+          <label key={field}>
+            <span>{label}</span>
+            <select
+              aria-label={`${label} column`}
+              value={String(mapping[field] ?? "")}
+              onChange={(event) =>
+                onChange({
+                  ...mapping,
+                  [field]: event.target.value || undefined,
+                })
+              }
+            >
+              <option value="">Automatic</option>
+              {columns.map((column) => (
+                <option key={column} value={column}>
+                  {column}
+                </option>
+              ))}
+            </select>
+          </label>
+        ))}
+        {(kind === "line" || kind === "heatmap") && (
+          <label>
+            <span>Time bucket (ms)</span>
+            <Input
+              aria-label="Time bucket in milliseconds"
+              type="number"
+              min={0.001}
+              step="any"
+              placeholder="Infer from result"
+              value={mapping.timeBucketMs ?? ""}
+              onChange={(event) =>
+                onChange({
+                  ...mapping,
+                  timeBucketMs: event.target.value
+                    ? Number(event.target.value)
+                    : undefined,
+                })
+              }
+            />
+          </label>
+        )}
+        {kind === "heatmap" && (
+          <label>
+            <span>Value bucket size</span>
+            <Input
+              aria-label="Value bucket size"
+              type="number"
+              min={0.001}
+              step="any"
+              placeholder="Infer from result"
+              value={mapping.valueBucketSize ?? ""}
+              onChange={(event) =>
+                onChange({
+                  ...mapping,
+                  valueBucketSize: event.target.value
+                    ? Number(event.target.value)
+                    : undefined,
+                })
+              }
+            />
+          </label>
+        )}
+      </div>
+    </details>
+  );
+}
 function Explore({
   api,
   preview,
@@ -602,45 +723,74 @@ function Explore({
   navigate: (path: string) => void;
   notify: (message: string) => void;
 }) {
-  const [query, setQuery] = useState<QuerySpec>(() => {
+  const [example] = useState(() => {
     const id = new URLSearchParams(location.search).get("template");
-    return {
-      ...initialQuery(),
-      ...(templates.some((t) => t.id === id)
-        ? { template: id as QuerySpec["template"] }
-        : {}),
-    };
+    return sqlExample(
+      templates.some((t) => t.id === id)
+        ? (id as PresetQuerySpec["template"])
+        : "request_rate",
+    );
   });
-  const [result, setResult] = useState<QueryResult | null>(() =>
-    preview ? previewResult(query) : null,
+  const [query, setQuery] = useState<SqlQuerySpec>(example.query);
+  const [parameterText, setParameterText] = useState(
+    JSON.stringify(example.query.parameters, null, 2),
   );
+  const [kind, setKind] = useState<VisualizationKind>(example.kind);
+  const [mapping, setMapping] = useState<VisualizationMapping>(example.mapping);
+  const [result, setResult] = useState<QueryResult | null>(null);
   const [loading, setLoading] = useState(false),
     [saving, setSaving] = useState(false),
     [error, setError] = useState(""),
     [showSql, setShowSql] = useState(false),
-    [showTable, setShowTable] = useState(false),
     [title, setTitle] = useState(""),
     [showSave, setShowSave] = useState(false);
-  const changed =
-    result && JSON.stringify(query) !== JSON.stringify(result.query);
+  let changed = false;
+  if (result) {
+    try {
+      changed =
+        query.sql !== result.sql ||
+        query.limit !== result.query.limit ||
+        JSON.stringify(parseParameters(parameterText)) !==
+          JSON.stringify(result.parameters);
+    } catch {
+      changed = true;
+    }
+  }
+  function loadExample(id: PresetQuerySpec["template"]) {
+    const next = sqlExample(id);
+    setQuery(next.query);
+    setParameterText(JSON.stringify(next.query.parameters, null, 2));
+    setKind(next.kind);
+    setMapping(next.mapping);
+    setError("");
+  }
   async function run(event: FormEvent) {
     event.preventDefault();
     setError("");
-    if (!(new Date(query.from) < new Date(query.to))) {
-      setError("The end time must be after the start time.");
+    if (preview) {
+      setError("Connect your workspace to execute SQL against ClickHouse.");
       return;
     }
     setLoading(true);
     try {
-      setResult(
-        preview
-          ? previewResult(query)
-          : await api<QueryResult>("/api/query", {
-              method: "POST",
-              body: JSON.stringify(query),
-            }),
+      const parameters = parseParameters(parameterText);
+      const next = await api<QueryResult>("/api/query", {
+        method: "POST",
+        body: JSON.stringify({
+          sql: query.sql,
+          parameters,
+          limit: query.limit,
+        }),
+      });
+      setResult(next);
+      setMapping((current) =>
+        Object.fromEntries(
+          Object.entries(current).filter(
+            ([, value]) =>
+              typeof value === "number" || next.columns.includes(String(value)),
+          ),
+        ),
       );
-      setShowTable(false);
     } catch (err) {
       setError((err as Error).message);
     } finally {
@@ -657,8 +807,9 @@ function Explore({
         method: "POST",
         body: JSON.stringify({
           query: result.query,
-          title: title.trim() || templateFor(result.query).title,
-          visualization: showTable ? "table" : templateFor(result.query).kind,
+          title: title.trim() || "SQL query",
+          visualization: kind,
+          mapping: kind === "table" ? undefined : mapping,
         }),
       });
       notify("Query result preserved in R2.");
@@ -674,95 +825,99 @@ function Explore({
       <PageHeading
         eyebrow="FROM SIGNAL TO ANSWER"
         title="Explore"
-        description="Ask a precise question. Inspect the result. Keep the evidence."
+        description="Write ClickHouse SQL. Visualize the result. Keep the evidence."
       />
       <form className="panel query-panel" onSubmit={run}>
         <div className="query-topline">
           <span className="field-label">
-            <Database size={16} /> Query template
+            <Database size={16} /> SQL editor
           </span>
-          <span className="subtle-badge">Fixed time range</span>
+          <span className="subtle-badge">ClickHouse SQL</span>
         </div>
-        <div className="template-picker">
+        <div className="template-picker" aria-label="SQL examples">
+          <span className="example-label">Start from an example</span>
           {templates.map((template) => (
             <button
               type="button"
               key={template.id}
-              className={query.template === template.id ? "selected" : ""}
-              onClick={() => setQuery({ ...query, template: template.id })}
+              onClick={() => loadExample(template.id)}
             >
               {template.title}
             </button>
           ))}
         </div>
-        <div className="query-fields">
-          <label>
-            <span>From (UTC)</span>
-            <Input
-              aria-label="From (UTC)"
-              type="datetime-local"
-              required
-              value={query.from.slice(0, 16)}
-              onChange={(event) => {
-                if (event.target.value)
-                  setQuery({ ...query, from: `${event.target.value}:00.000Z` });
-              }}
+        <label className="sql-editor-label">
+          <span>Query</span>
+          <textarea
+            className="sql-editor"
+            aria-label="SQL query"
+            required
+            rows={10}
+            spellCheck={false}
+            value={query.sql}
+            onChange={(event) =>
+              setQuery({ ...query, sql: event.target.value })
+            }
+          />
+        </label>
+        <div className="sql-options">
+          <label className="parameter-editor">
+            <span>Parameters (JSON)</span>
+            <textarea
+              className="sql-editor"
+              aria-label="SQL parameters"
+              rows={5}
+              spellCheck={false}
+              value={parameterText}
+              onChange={(event) => setParameterText(event.target.value)}
             />
+            <small>
+              Use typed placeholders such as {"{service:String}"} or{" "}
+              {"{count:UInt64}"} in SQL.
+            </small>
           </label>
-          <label>
-            <span>To (UTC)</span>
-            <Input
-              aria-label="To (UTC)"
-              type="datetime-local"
-              required
-              value={query.to.slice(0, 16)}
-              onChange={(event) => {
-                if (event.target.value)
-                  setQuery({ ...query, to: `${event.target.value}:00.000Z` });
-              }}
-            />
-          </label>
-          <label>
-            <span>Service</span>
-            <Input
-              aria-label="Service"
-              placeholder="All services"
-              value={query.service ?? ""}
-              onChange={(event) =>
-                setQuery({ ...query, service: event.target.value || undefined })
-              }
-            />
-          </label>
-          {query.template === "trace_waterfall" && (
-            <label className="trace-field">
-              <span>Trace ID</span>
+          <div className="sql-run-options">
+            <label>
+              <span>Result limit</span>
               <Input
-                aria-label="Trace ID"
-                placeholder="32 hexadecimal characters"
-                required={!preview}
-                pattern="[a-fA-F0-9]{32}"
-                value={query.traceId ?? ""}
+                aria-label="Result limit"
+                type="number"
+                required
+                min={1}
+                max={10000}
+                value={query.limit ?? 1000}
                 onChange={(event) =>
-                  setQuery({
-                    ...query,
-                    traceId: event.target.value || undefined,
-                  })
+                  setQuery({ ...query, limit: Number(event.target.value) })
                 }
               />
             </label>
-          )}
-          <Button variant="primary" type="submit" disabled={loading}>
-            <Play size={15} weight="fill" />
-            {loading ? "Running…" : "Run query"}
-          </Button>
+            <Button variant="primary" type="submit" disabled={loading}>
+              <Play size={15} weight="fill" />
+              {loading ? "Running…" : "Run query"}
+            </Button>
+            {preview && (
+              <button
+                type="button"
+                className="text-link"
+                onClick={() => navigate("/settings")}
+              >
+                Connect workspace <ArrowRight size={14} />
+              </button>
+            )}
+          </div>
         </div>
+        <p className="sql-help">
+          Use fixed time values and a stable ORDER BY to make results
+          reproducible. Tables include otel_traces, otel_logs, and
+          otel_metrics_*.
+        </p>
       </form>
       {error && <ErrorBox message={error} />}
       <section className="panel result-panel">
         <div className="panel-header">
           <div>
             <h2>
-              {result ? templateFor(result.query).title : "Query result"}{" "}
+              Query result{" "}
               {changed && (
                 <span className="subtle-badge">
                   Query changed · run to update
@@ -771,51 +926,63 @@ function Explore({
             </h2>
             <p>
               {result
-                ? templateFor(result.query).description
-                : "Choose a template and run your first query"}
+                ? "Choose how to display the returned columns"
+                : "Run SQL to inspect your data"}
             </p>
           </div>
-          {result && (
-            <div className="panel-actions">
-              <div className="segmented">
-                <button
-                  aria-pressed={!showTable}
-                  onClick={() => setShowTable(false)}
-                >
-                  Visualization
-                </button>
-                <button
-                  aria-pressed={showTable}
-                  onClick={() => setShowTable(true)}
-                >
-                  Data
-                </button>
-              </div>
+          <div className="panel-actions">
+            <label className="visualization-selector">
+              <span>Display</span>
+              <select
+                aria-label="Visualization"
+                value={kind}
+                onChange={(event) =>
+                  setKind(event.target.value as VisualizationKind)
+                }
+              >
+                <option value="table">Table</option>
+                <option value="line">Line graph</option>
+                <option value="heatmap">Heatmap</option>
+                <option value="waterfall">Trace waterfall</option>
+              </select>
+            </label>
+            {result && (
               <Button
                 variant="secondary"
-                onClick={() =>
-                  preview ? navigate("/settings") : setShowSave(!showSave)
-                }
+                onClick={() => setShowSave(!showSave)}
               >
                 <FloppyDisk size={16} /> Save view
               </Button>
-            </div>
-          )}
+            )}
+          </div>
         </div>
+        {result && (
+          <MappingFields
+            kind={kind}
+            columns={result.columns}
+            mapping={mapping}
+            onChange={setMapping}
+          />
+        )}
         {loading ? (
           <div className="loading-chart">Querying ClickHouse…</div>
         ) : result ? (
           <>
-            <Visualization
-              result={result}
-              kind={showTable ? "table" : templateFor(result.query).kind}
-            />
+            <Visualization result={result} kind={kind} mapping={mapping} />
             <ResultMeta result={result} />
           </>
         ) : (
           <Empty
-            title="Your next answer starts here"
-            text="Choose a visualization and time range, then run a query."
+            title={
+              preview
+                ? "Connect to run your SQL"
+                : "Your next answer starts here"
+            }
+            text={
+              preview
+                ? "The SQL editor is ready. Connect your workspace to execute queries and save their results."
+                : "Write a query or edit an example, then choose a visualization for its columns."
+            }
           />
         )}
         {showSave && !preview && (
@@ -825,15 +992,14 @@ function Explore({
               <Input
                 aria-label="View title"
                 maxLength={160}
-                placeholder={
-                  result ? templateFor(result.query).title : "Untitled view"
-                }
+                placeholder="SQL query"
                 value={title}
                 onChange={(event) => setTitle(event.target.value)}
               />
             </label>
             <p>
-              Runs this exact query and stores its result permanently in R2.
+              Runs the last executed SQL and parameters again and stores its
+              result and chart columns permanently in R2.
             </p>
             <Button type="submit" variant="primary" disabled={saving}>
               {saving ? "Saving…" : "Save permanent view"}
@@ -849,7 +1015,7 @@ function Explore({
             aria-expanded={showSql}
           >
             <span>
-              <span className="code-icon">SQL</span> Query details
+              <span className="code-icon">SQL</span> Executed query details
             </span>
             <span>
               {showSql ? "Hide" : "Show"} SQL {showSql ? "−" : "+"}
@@ -864,8 +1030,9 @@ function Explore({
         </section>
       )}
       <div className="info-line">
-        <CheckCircle size={16} /> Saved views capture the query, parameters, and
-        result together. Opening a saved view never reruns its query.
+        <CheckCircle size={16} /> Saved views capture the SQL, parameters, chart
+        columns, and result together. Opening a saved view never reruns its
+        query.
       </div>
     </>
   );
@@ -1062,13 +1229,20 @@ function SnapshotPage({
             <CheckCircle size={14} /> Preserved in R2
           </span>
         </div>
-        <Visualization result={snapshot} kind={snapshot.visualization} />
+        <Visualization
+          result={snapshot}
+          kind={snapshot.visualization}
+          mapping={snapshot.mapping}
+        />
         <ResultMeta result={snapshot} />
       </section>
       <details className="panel snapshot-details">
         <summary>Query and integrity details</summary>
         <pre>{snapshot.sql}</pre>
         <pre>{JSON.stringify(snapshot.parameters, null, 2)}</pre>
+        {snapshot.mapping && (
+          <pre>{JSON.stringify(snapshot.mapping, null, 2)}</pre>
+        )}
         <div className="hash">
           SHA-256 <code>{snapshot.sha256}</code>
         </div>
@@ -1078,7 +1252,9 @@ function SnapshotPage({
 }
 const emptyAlert: AlertInput = {
   name: "",
-  template: "error_rate",
+  sql: alertSql,
+  parameters: {},
+  valueColumn: "value",
   windowMinutes: 5,
   threshold: 1,
   comparison: "gt",
@@ -1099,6 +1275,7 @@ function Alerts({
 }) {
   const [alerts, setAlerts] = useState<AlertRule[]>([]),
     [form, setForm] = useState<AlertInput>(emptyAlert),
+    [parameterText, setParameterText] = useState("{}"),
     [editing, setEditing] = useState<string | null>(null),
     [open, setOpen] = useState(false),
     [error, setError] = useState(""),
@@ -1134,9 +1311,13 @@ function Alerts({
     setBusy(true);
     setError("");
     try {
+      const payload =
+        form.sql !== undefined
+          ? { ...form, parameters: parseParameters(parameterText) }
+          : form;
       const alert = await api<AlertRule>(
         editing ? `/api/alerts/${editing}` : "/api/alerts",
-        { method: editing ? "PUT" : "POST", body: JSON.stringify(form) },
+        { method: editing ? "PUT" : "POST", body: JSON.stringify(payload) },
       );
       setAlerts((current) =>
         editing
@@ -1146,6 +1327,7 @@ function Alerts({
       setOpen(false);
       setEditing(null);
       setForm(emptyAlert);
+      setParameterText("{}");
       notify("Alert rule saved.");
     } catch (err) {
       setError((err as Error).message);
@@ -1177,6 +1359,7 @@ function Alerts({
           variant="primary"
           onClick={() => {
             setForm(emptyAlert);
+            setParameterText("{}");
             setEditing(null);
             setOpen(true);
           }}
@@ -1203,7 +1386,7 @@ function Alerts({
               <Input
                 aria-label="Alert name"
                 required
-                placeholder="Elevated error rate"
+                placeholder="High request count"
                 value={form.name}
                 onChange={(event) =>
                   setForm({ ...form, name: event.target.value })
@@ -1211,31 +1394,113 @@ function Alerts({
               />
             </label>
             <label>
-              <span>Service</span>
-              <Input
-                aria-label="Alert service"
-                placeholder="All services"
-                value={form.service ?? ""}
-                onChange={(event) =>
-                  setForm({ ...form, service: event.target.value || undefined })
-                }
-              />
-            </label>
-            <label>
-              <span>Query</span>
+              <span>Query source</span>
               <select
-                value={form.template}
-                onChange={(event) =>
-                  setForm({
-                    ...form,
-                    template: event.target.value as AlertInput["template"],
-                  })
-                }
+                aria-label="Alert query source"
+                value={form.sql !== undefined ? "sql" : "preset"}
+                onChange={(event) => {
+                  const {
+                    sql: _sql,
+                    template: _template,
+                    parameters: _parameters,
+                    valueColumn: _valueColumn,
+                    service: _service,
+                    ...base
+                  } = form;
+                  setForm(
+                    event.target.value === "sql"
+                      ? {
+                          ...base,
+                          sql: alertSql,
+                          parameters: {},
+                          valueColumn: "value",
+                        }
+                      : { ...base, template: "error_rate" },
+                  );
+                  setParameterText("{}");
+                }}
               >
-                <option value="error_rate">Error rate (%)</option>
-                <option value="request_rate">Request rate (req/s)</option>
+                <option value="sql">SQL query</option>
+                <option value="preset">Preset query</option>
               </select>
             </label>
+            {form.sql !== undefined ? (
+              <>
+                <label className="wide-field">
+                  <span>SQL query</span>
+                  <textarea
+                    aria-label="Alert SQL query"
+                    className="sql-editor"
+                    rows={7}
+                    required
+                    spellCheck={false}
+                    value={form.sql}
+                    onChange={(event) =>
+                      setForm({ ...form, sql: event.target.value })
+                    }
+                  />
+                  <small className="sql-help">
+                    Return exactly one row. The selected value column must be
+                    numeric. Reserved {"{from:String}"} and {"{to:String}"}{" "}
+                    parameters receive the evaluation window in UTC.
+                  </small>
+                </label>
+                <label>
+                  <span>Parameters (JSON)</span>
+                  <textarea
+                    aria-label="Alert SQL parameters"
+                    className="sql-editor"
+                    rows={4}
+                    spellCheck={false}
+                    value={parameterText}
+                    onChange={(event) => setParameterText(event.target.value)}
+                  />
+                </label>
+                <label>
+                  <span>Value column</span>
+                  <Input
+                    aria-label="Alert value column"
+                    required
+                    value={form.valueColumn ?? "value"}
+                    onChange={(event) =>
+                      setForm({ ...form, valueColumn: event.target.value })
+                    }
+                  />
+                </label>
+              </>
+            ) : (
+              <>
+                <label>
+                  <span>Service</span>
+                  <Input
+                    aria-label="Alert service"
+                    placeholder="All services"
+                    value={form.service ?? ""}
+                    onChange={(event) =>
+                      setForm({
+                        ...form,
+                        service: event.target.value || undefined,
+                      })
+                    }
+                  />
+                </label>
+                <label>
+                  <span>Query</span>
+                  <select
+                    value={form.template}
+                    onChange={(event) =>
+                      setForm({
+                        ...form,
+                        template: event.target.value as AlertInput["template"],
+                      })
+                    }
+                  >
+                    <option value="error_rate">Error rate (%)</option>
+                    <option value="request_rate">Request rate (req/s)</option>
+                  </select>
+                </label>
+              </>
+            )}
             <label>
               <span>Evaluation window (minutes)</span>
               <Input
@@ -1272,12 +1537,17 @@ function Alerts({
             </label>
             <label>
               <span>
-                Threshold {form.template === "error_rate" ? "(%)" : "(req/s)"}
+                Threshold{" "}
+                {form.sql !== undefined
+                  ? ""
+                  : form.template === "error_rate"
+                    ? "(%)"
+                    : "(req/s)"}
               </span>
               <Input
                 aria-label="Threshold"
                 type="number"
-                min={0}
+                min={form.sql !== undefined ? undefined : 0}
                 step="any"
                 required
                 value={form.threshold}
@@ -1357,13 +1627,22 @@ function Alerts({
                 <div>
                   <strong>{rule.name}</strong>
                   <p>
-                    {rule.template === "error_rate"
-                      ? "Error rate"
-                      : "Request rate"}{" "}
+                    {rule.sql !== undefined
+                      ? `SQL · ${rule.valueColumn || "value"}`
+                      : rule.template === "error_rate"
+                        ? "Error rate"
+                        : "Request rate"}{" "}
                     {{ gt: ">", gte: "≥", lt: "<", lte: "≤" }[rule.comparison]}{" "}
                     {rule.threshold}
-                    {rule.template === "error_rate" ? "%" : " req/s"} ·{" "}
-                    {rule.windowMinutes} min · {rule.service || "All services"}
+                    {rule.sql !== undefined
+                      ? ""
+                      : rule.template === "error_rate"
+                        ? "%"
+                        : " req/s"}{" "}
+                    · {rule.windowMinutes} min
+                    {rule.sql !== undefined
+                      ? ""
+                      : ` · ${rule.service || "All services"}`}
                   </p>
                   <small>
                     {rule.lastEvaluatedAt
@@ -1378,7 +1657,17 @@ function Alerts({
                   variant="secondary"
                   size="sm"
                   onClick={() => {
-                    setForm(rule);
+                    const {
+                      id: _id,
+                      createdAt: _createdAt,
+                      lastEvaluatedAt: _lastEvaluatedAt,
+                      lastTriggeredAt: _lastTriggeredAt,
+                      ...input
+                    } = rule;
+                    setForm(input);
+                    setParameterText(
+                      JSON.stringify(rule.parameters ?? {}, null, 2),
+                    );
                     setEditing(rule.id);
                     setOpen(true);
                   }}
@@ -1400,7 +1689,7 @@ function Alerts({
         ) : (
           <Empty
             title="Stay ahead of the unexpected"
-            text="Create a threshold alert for request volume or error rate. We'll send your webhook the finding and a preserved snapshot."
+            text="Create a threshold alert from any SQL query that returns one numeric value. We'll send your webhook the query and observed value."
           >
             <Button variant="secondary" onClick={() => setOpen(true)}>
               <Plus size={16} /> Create your first alert

@@ -8,8 +8,15 @@ import {
 } from "@modelcontextprotocol/ext-apps/server";
 import { z } from "zod";
 import type { Env } from "./env";
+import { ClickHouseError, ClickHouseConfigurationError } from "./clickhouse";
 import type { Snapshot } from "../shared/types";
-import { QUERY_TEMPLATES, querySchema, runQuery } from "./queries";
+import {
+  QUERY_TEMPLATES,
+  querySchema,
+  presetQuerySchema,
+  sqlQuerySchema,
+  runQuery,
+} from "./queries";
 import {
   getSnapshot,
   listSnapshots,
@@ -41,6 +48,19 @@ const appSecurity = {
   },
 };
 const idSchema = z.object({ id: z.string().uuid() }).strict();
+// SDK v1 advertises top-level object schemas; preserve union validation inside the handler.
+const queryToolSchema = z
+  .object({
+    sql: sqlQuerySchema.shape.sql.optional(),
+    parameters: sqlQuerySchema.shape.parameters.optional(),
+    limit: sqlQuerySchema.shape.limit.optional(),
+    template: presetQuerySchema.shape.template.optional(),
+    from: presetQuerySchema.shape.from.optional(),
+    to: presetQuerySchema.shape.to.optional(),
+    service: presetQuerySchema.shape.service.optional(),
+    traceId: presetQuerySchema.shape.traceId.optional(),
+  })
+  .strict();
 
 function dataResult(data: Record<string, unknown>): CallToolResult {
   return {
@@ -68,7 +88,12 @@ async function safely(
   try {
     return await action();
   } catch (error) {
-    if (error instanceof AlertError) return errorResult(error.message);
+    if (
+      error instanceof AlertError ||
+      error instanceof ClickHouseError ||
+      error instanceof ClickHouseConfigurationError
+    )
+      return errorResult(error.message);
     if (error instanceof z.ZodError)
       return errorResult(
         `Invalid input: ${error.issues.map((issue) => issue.message).join("; ")}`,
@@ -88,7 +113,7 @@ function createServer(env: Env): McpServer {
     {
       title: "List observability queries",
       description:
-        "List deterministic ClickHouse query templates and compatible visualizations. Queries require absolute from/to ISO 8601 timestamps. Time windows use [from, to).",
+        "List optional query presets to use as starting examples. run_query accepts arbitrary read-only ClickHouse SQL, including CTEs, joins, metrics, and typed parameters. Presets use absolute from/to times and [from, to) windows.",
       inputSchema: z.object({}).strict(),
       annotations: readOnly,
     },
@@ -96,16 +121,38 @@ function createServer(env: Env): McpServer {
   );
 
   server.registerTool(
+    "describe_schema",
+    {
+      title: "Describe available ClickHouse tables",
+      description:
+        "List queryable tables and their columns, ClickHouse types, and default expressions in the configured database. Use this before composing SQL, especially joins or metric queries.",
+      inputSchema: z.object({}).strict(),
+      annotations: readOnly,
+    },
+    () =>
+      safely(async () =>
+        dataResult({
+          result: await runQuery(env, {
+            sql: "SELECT table, name, type, default_kind, default_expression FROM system.columns WHERE database = currentDatabase() ORDER BY table, position",
+            limit: 10000,
+          }),
+        }),
+      ),
+  );
+
+  server.registerTool(
     "run_query",
     {
       title: "Run observability query",
       description:
-        "Execute a parameterized, read-only query against ClickHouse. Returns ordered rows, SQL, parameters, and execution time. Data can arrive late; use create_visualization to freeze exact results in R2.",
-      inputSchema: querySchema,
+        "Execute arbitrary read-only ClickHouse SQL by passing sql, optional parameters, and limit. Supports SELECT, WITH, joins, aggregations, window functions, and DESCRIBE. Use {name:Type} placeholders with parameters; include ORDER BY and explicit time parameters for repeatable selections. Returns rows, exact SQL, bound parameters, execution time, and truncation. Optional presets are also accepted. Use create_visualization to preserve the exact returned result in R2.",
+      inputSchema: queryToolSchema,
       annotations: { ...readOnly, idempotentHint: false },
     },
     (query) =>
-      safely(async () => dataResult({ result: await runQuery(env, query) })),
+      safely(async () =>
+        dataResult({ result: await runQuery(env, querySchema.parse(query)) }),
+      ),
   );
 
   registerAppTool(
@@ -114,7 +161,7 @@ function createServer(env: Env): McpServer {
     {
       title: "Save observability visualization",
       description:
-        "Run a deterministic query over an absolute time window, save its complete returned rows and provenance permanently to R2, and display a line graph, trace waterfall, heatmap, or table. Creates a new immutable snapshot and stable URL each time. The URL uses the dashboard authentication.",
+        "Execute arbitrary read-only SQL or a preset query, save its returned rows, SQL and parameters in R2, and render a line graph, trace waterfall, heatmap, or table. Optional mapping selects result columns for the chart; table accepts any columns. The frozen result and authenticated URL remain unchanged even when later SQL executions differ. Creates a new immutable snapshot each time.",
       inputSchema: snapshotSchema,
       annotations: {
         readOnlyHint: false,
@@ -168,7 +215,7 @@ function createServer(env: Env): McpServer {
     {
       title: "Create alert",
       description:
-        "Create a scheduled threshold alert. error_rate is percent of root spans with error status; request_rate is average root spans per second over the whole window. Rules evaluate on minute boundaries and deliver signed webhooks with durable retries. The HTTPS webhook hostname must be configured in WEBHOOK_ALLOWED_HOSTS.",
+        "Create a scheduled threshold alert using arbitrary read-only sql with optional parameters and valueColumn (default value). SQL must return exactly one row with a numeric value; from/to parameters are reserved for the absolute evaluation window. Existing error_rate and request_rate presets are also supported. Evaluations run on minute boundaries and deliver signed webhooks with retries. The HTTPS webhook hostname must be configured in WEBHOOK_ALLOWED_HOSTS.",
       inputSchema: alertInputSchema,
       annotations: {
         readOnlyHint: false,
